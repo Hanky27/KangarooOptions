@@ -1,0 +1,49 @@
+# MIT License
+# Copyright (c) 2026 Heinrich Munz
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+# Copy to config.yaml and adjust the paths for your machine.
+# API keys: either export ALPACA_API_KEY / ALPACA_SECRET_KEY in your
+# environment, or point env_file at a KEY=VALUE file containing them.
+# The agent is paper-only: it refuses to start if ALPACA_LIVE_TRADE is set.
+
+underlying: SPY
+
+# Grid parameters (carried over from the FX Kangaroo, tuning still open).
+rebuy_1st_pct: 1.2      # % adverse underlying move before the 1st rebuy
+rebuy_pct: 0.10         # % adverse move for every further rebuy
+tp_pct: 0.10            # % of underlying price defining the take-profit cash
+initial_qty: 1          # contracts of the first leg
+max_invest_count: 20    # hard cap of legs per cluster
+start_long: true        # first cluster is a CALL cluster; Mode1 toggles after
+
+# Option contract selection: nearest expiration inside the DTE window,
+# strike nearest to spot.
+dte_min: 4
+dte_max: 10
+
+# Sampling rates in seconds (no timeouts anywhere - pure sampling).
+poll_seconds: 5
+poll_fill_seconds: 2
+
+# Paths.
+cli_path: /path/to/alpaca        # official Alpaca CLI binary (github.com/alpacahq/cli)
+env_file: null                   # optional KEY=VALUE file with the two API keys
+state_file: state/kangaroo_state.json
