@@ -106,6 +106,14 @@ def test_mode1_toggle_on_close():
     assert core.is_long is True, "and back to CALL"
 
 
+def test_no_toggle_close_keeps_direction():
+    core = make_core()
+    core.add_leg("P1", 1, 100.0, 1.0)
+    core.on_cluster_closed(toggle=False)
+    assert core.is_long is True, "toggle=False must keep the direction"
+    assert core.cluster_id == 2 and core.invest_count == 0
+
+
 def test_persistence_roundtrip():
     core = make_core()
     core.add_leg("SPY260904C00780000", 2, 770.25, 1.07)

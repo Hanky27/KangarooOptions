@@ -19,7 +19,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Kangaroo Options core - anti-martingale grid state machine, options edition.
+"""Kangaroo Options core - martingale-style grid state machine, options edition.
 
 Stripped-down port of the author's cTrader Kangaroo V2.2 grid logic for the
 Alpaca AI Trading Agents Hackathon. Deliberately reduced to ONE purpose
@@ -164,11 +164,14 @@ class KangarooCore:
         threshold = self.invest_count * self.initial_qty * self.contract_multiplier * tp_value
         return cluster_profit_usd > threshold
 
-    def on_cluster_closed(self) -> None:
-        """Mode1: after a profitable cluster close the direction toggles
-        (original: Instance.cs `IsLong = !IsLong`)."""
+    def on_cluster_closed(self, toggle: bool = True) -> None:
+        """End the current cluster. toggle=True is the original Mode1
+        behavior (Instance.cs `IsLong = !IsLong`); the put-only agent passes
+        toggle=False and keeps its direction (backtests 2026-08-28: the
+        Mode1 short side lost money in every measured style)."""
         self.legs.clear()
-        self.is_long = not self.is_long
+        if toggle:
+            self.is_long = not self.is_long
         self.cluster_id += 1
 
     # --- persistence -----------------------------------------------------

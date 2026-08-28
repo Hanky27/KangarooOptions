@@ -160,6 +160,40 @@ class AlpacaCli:
             args.append("--dry-run")
         return self._run(args)
 
+    def submit_mleg_limit(self, legs: list[dict], qty: int, limit_price: float,
+                          client_order_id: str, dry_run: bool = False) -> dict:
+        """Multi-leg LIMIT day order. Alpaca convention: negative limit_price
+        = minimum net CREDIT, positive = maximum net debit (order form
+        verified with a live paper order on 2026-08-28). Each leg dict:
+        {symbol, ratio_qty (string), side, position_intent}."""
+        args = [
+            "order", "submit",
+            "--order-class", "mleg",
+            "--qty", str(qty),
+            "--type", "limit",
+            "--limit-price", str(limit_price),
+            "--time-in-force", "day",
+            "--client-order-id", client_order_id,
+            "--legs", json.dumps(legs),
+        ]
+        if dry_run:
+            args.append("--dry-run")
+        return self._run(args)
+
+    def submit_equity_market(self, symbol: str, qty: float, side: str,
+                             client_order_id: str) -> dict:
+        """Market day order on the underlying - used ONLY by the assignment
+        gate (an assigned stock position is flattened immediately)."""
+        return self._run([
+            "order", "submit",
+            "--symbol", symbol,
+            "--qty", str(qty),
+            "--side", side,
+            "--type", "market",
+            "--time-in-force", "day",
+            "--client-order-id", client_order_id,
+        ])
+
     def cancel_order(self, order_id: str) -> None:
         """Cancel ONE order by id. There is deliberately no cancel-all here:
         it would also kill orders this agent does not own."""

@@ -27,21 +27,24 @@
 underlying: SPY
 
 # Grid parameters (carried over from the FX Kangaroo, tuning still open).
-rebuy_1st_pct: 1.2      # % adverse underlying move before the 1st rebuy
-rebuy_pct: 0.10         # % adverse move for every further rebuy
+rebuy_1st_pct: 1.2      # % underlying drop before the 1st rebuy
+rebuy_pct: 0.10         # % drop for every further rebuy
 tp_pct: 0.10            # % of underlying price defining the take-profit cash
-initial_qty: 1          # contracts of the first leg
+initial_qty: 1          # spreads of the first leg
 max_invest_count: 20    # hard cap of legs per cluster
-start_long: true        # first cluster is a CALL cluster; Mode1 toggles after
 
-# Option contract selection: nearest expiration inside the DTE window,
-# strike nearest to spot.
+# Spread selection: nearest expiration inside the DTE window, short strike
+# nearest to spot, wing = first width candidate that exists as a strike.
 dte_min: 4
 dte_max: 10
+spread_widths: [5, 6, 4, 7, 3, 8, 10]
 
 # Sampling rates in seconds (no timeouts anywhere - pure sampling).
 poll_seconds: 5
 poll_fill_seconds: 2
+# Unfilled limit orders are canceled by ID after this many fill polls and
+# re-quoted on the next loop.
+fill_requote_samples: 30
 
 # Paths.
 cli_path: /path/to/alpaca        # official Alpaca CLI binary (github.com/alpacahq/cli)
