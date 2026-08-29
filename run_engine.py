@@ -182,10 +182,17 @@ def _ensure_hour_bars(underlying: str, start: dt.date, end: dt.date) -> Path:
     bars at internal segment boundaries even BELOW the row limit (Jan 2026:
     176 rows, token after 2026-01-16), so any fetch without token-following
     silently loses data - a month-chunk loop offers no protection. Bars are
-    filtered to NY regular-trading hours 9..15 (the only hours option bars
-    exist for) and written atomically as {"bars":[...]} like the daily
-    store. Re-fetched only when the requested window is not covered."""
-    from fetch_alpaca_bars import fetch
+    filtered to the exchange's own session (09:00 NY up to the day's close
+    hour from fetch_alpaca_bars.session_closes) and written atomically as
+    {"bars":[...]} like the daily store. Re-fetched only when the requested
+    window is not covered.
+
+    The close hour comes from the calendar, not from a constant: on the
+    eight early-close days between 2024 and 2026 the exchange shuts at
+    13:00 while stock bars keep printing, and option bars do not exist for
+    those hours - a fixed 9..15 filter made the simulator fail loud with
+    "no tradable call credit spread on 2025-11-28T20:00:00Z"."""
+    from fetch_alpaca_bars import fetch, session_closes
     path = HERE / "data" / f"{underlying.lower()}_1h.json"
     if path.is_file():
         body = json.loads(path.read_text(encoding="utf-8"))
@@ -197,10 +204,18 @@ def _ensure_hour_bars(underlying: str, start: dt.date, end: dt.date) -> Path:
     from zoneinfo import ZoneInfo
     ny = ZoneInfo("America/New_York")
     raw = fetch(underlying, "1Hour", start.isoformat(), end.isoformat())
+    closes = session_closes(start.isoformat(), end.isoformat())
     out = []
     for b in raw:
         utc = dt.datetime.fromisoformat(b["t"].replace("Z", "+00:00"))
-        if 9 <= utc.astimezone(ny).hour <= 15:
+        local = utc.astimezone(ny)
+        day = local.date().isoformat()
+        if day not in closes:      # exchange holiday - no session at all
+            continue
+        # A bar stamped H covers H..H+1, so it belongs to the session only
+        # while H is strictly before the close hour.
+        close_hour = int(closes[day].split(":")[0])
+        if 9 <= local.hour < close_hour:
             out.append(b)
     if not out:
         raise RuntimeError(f"no RTH hourly bars for {underlying} "

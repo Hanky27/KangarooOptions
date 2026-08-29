@@ -53,6 +53,29 @@ def _cli_env() -> dict:
     return env
 
 
+def session_closes(start: str, end: str) -> dict[str, str]:
+    """Exchange session close per trading day: {"YYYY-MM-DD": "HH:MM"}.
+
+    The regular close is 16:00, but the exchange closes at 13:00 on eight
+    days between 2024 and 2026 (measured 2026-08-29 against this endpoint:
+    2024-07-03, 2024-11-29, 2024-12-24, 2025-07-03, 2025-11-28, 2025-12-24,
+    2026-11-27, 2026-12-24). Stock bars still exist after an early close -
+    on 2025-11-28 the 15:00 NY bar carries 89,086 shares against 17,701,241
+    on the neighbouring full day - while option bars do not, so a fixed
+    9..15 hour filter puts untradable bars into the hourly store."""
+    env = _cli_env()
+    proc = subprocess.run(
+        [CLI_PATH, "calendar", "--start", start, "--end", end, "-q"],
+        capture_output=True, text=True, env=env)
+    if proc.returncode != 0:
+        raise RuntimeError(f"alpaca calendar {start}..{end} failed: "
+                           f"{proc.stdout.strip()} {proc.stderr.strip()}")
+    body = json.loads(proc.stdout)
+    if isinstance(body, dict) and body.get("error"):
+        raise RuntimeError(f"alpaca calendar {start}..{end}: {body['error']}")
+    return {d["date"]: d["close"] for d in body}
+
+
 def fetch(symbol: str, timeframe: str, start: str, end: str) -> list[dict]:
     env = _cli_env()
     bars: list[dict] = []
