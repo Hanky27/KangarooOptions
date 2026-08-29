@@ -326,8 +326,9 @@ def main(argv=None) -> int:
         trade_no["n"] += 1
         end_d, end_t, _ = _stamp_parts(c["end"])
         open_d, open_t, _ = _stamp_parts(c["start"])
+        side = "buy" if c["direction"] == "long" else "sell"
         print(f"{end_d} {end_t}.000 | TRADE | "
-              f"id={trade_no['n']} sym={run_params['underlying']} dir=sell "
+              f"id={trade_no['n']} sym={run_params['underlying']} dir={side} "
               f"vol={c['legs_at_end']} in={c['start_price']:.2f} "
               f"out={c['end_price']:.2f} "
               f"net={c['result_usd']:.2f} gross={c['result_usd']:.2f} "
@@ -370,7 +371,12 @@ def main(argv=None) -> int:
             "entryTime": _ms_epoch(c["start"]),
             "closeTime": _ms_epoch(c["end"]),
             "symbol": run_params["underlying"],
-            "direction": "sell",
+            # MARKET side, not the option action. The chart draws this on the
+            # UNDERLYING axis (up/green for buy, down/red for sell), and a put
+            # credit spread is a bullish position even though its legs are
+            # sold. Long cluster = put spreads = buy; short cluster = call
+            # spreads = sell.
+            "direction": "buy" if c["direction"] == "long" else "sell",
             "volume": float(c["legs_at_end"]),
             # Underlying levels, not premiums: the chart's y axis is the
             # underlying, and its trade zoom folds entry/close into the y fit
@@ -387,7 +393,8 @@ def main(argv=None) -> int:
     ob = result["open_book"]
     if ob:
         open_items.append({
-            "symbol": run_params["underlying"], "direction": "sell",
+            "symbol": run_params["underlying"],
+            "direction": "buy" if ob["direction"] == "long" else "sell",
             "volume": float(ob["legs"]), "entryPrice": ob["start_price"],
             "currentPrice": ob["last_price"], "net": float(ob["mark_usd"]),
             "commissions": 0.0, "swap": 0.0,

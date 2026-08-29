@@ -33,10 +33,10 @@ engine: python
 # the daily store (bars_file), Hour = hourly grid on Alpaca 1Hour bars
 # (underlying store auto-fetched to data/<underlying>_1h.json, option marks
 # from 1Hour option bars). Any other TF fails loud.
-data_source: Alpaca/SPY/d1
+data_source: Alpaca/SPY/h1
 broker: Alpaca
 symbol: SPY
-timeframe: d1
+timeframe: h1
 starting_capital: 100000
 
 parameters:
