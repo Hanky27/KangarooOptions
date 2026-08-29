@@ -75,7 +75,7 @@ import os
 import subprocess
 from datetime import date, timedelta
 
-from kangaroo_core import KangarooCore
+from kangaroo_core import KangarooCore, settlement_pnl
 from backtest_underlying import RANGE_BLOWOUT_PCT, KNOWN_DEFECT_DAYS
 
 DEFAULT_PARAMS = dict(rebuy_1st_pct=1.2, rebuy_pct=0.10, tp_pct=0.10,
@@ -262,34 +262,14 @@ def run(bars: list[dict], params: dict, dte_min: int, dte_max: int,
         return (leg.entry_premium - net) * mult * leg.qty
 
     def leg_settle(leg, close: float) -> float:
+        """Settle one expiring leg through the shared core formula and keep
+        the ITM/OTM tally here (the core stays free of run statistics)."""
         meta = leg_meta[leg.option_symbol]
-        strike = meta["strike"]
-        if meta["kind"] == "long_option":
-            intrinsic = (max(close - strike, 0.0) if meta["right"] == "call"
-                         else max(strike - close, 0.0))
-            if intrinsic > 0:
-                stats["legs_expired_itm"] += 1
-            else:
-                stats["legs_expired_otm"] += 1
-            return (intrinsic - leg.entry_premium) * mult * leg.qty
-        if meta["kind"] == "short_put":
-            intrinsic = max(strike - close, 0.0)
-            if intrinsic > 0:
-                stats["legs_expired_itm"] += 1
-            else:
-                stats["legs_expired_otm"] += 1
-            return (leg.entry_premium - intrinsic) * mult * leg.qty
-        if meta["kind"] == "call_spread":
-            net_intrinsic = (max(close - strike, 0.0)
-                             - max(close - meta["wing_strike"], 0.0))
-        else:                                     # put_spread
-            net_intrinsic = (max(strike - close, 0.0)
-                             - max(meta["wing_strike"] - close, 0.0))
-        if net_intrinsic > 0:
-            stats["legs_expired_itm"] += 1
-        else:
-            stats["legs_expired_otm"] += 1
-        return (leg.entry_premium - net_intrinsic) * mult * leg.qty
+        pnl, itm = settlement_pnl(
+            meta["kind"], meta.get("right", ""), meta["strike"],
+            meta.get("wing_strike"), leg.entry_premium, leg.qty, close, mult)
+        stats["legs_expired_itm" if itm else "legs_expired_otm"] += 1
+        return pnl
 
     def leg_margin(leg) -> float:
         meta = leg_meta[leg.option_symbol]

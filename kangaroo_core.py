@@ -51,6 +51,43 @@ from dataclasses import dataclass, field
 VOLUME_GROWTH = 1.1
 
 
+def settlement_pnl(kind: str, right: str, strike: float,
+                   wing_strike: float | None, entry_premium: float,
+                   qty: int, underlying_close: float,
+                   contract_multiplier: int = 100) -> tuple[float, bool]:
+    """Realized USD of ONE leg that expires, plus whether it expired ITM.
+
+    Pure math, no I/O - the ONE place both the simulator and the live agent
+    settle an expiring leg, so a live cluster's take-profit decision cannot
+    drift from the backtested one.
+
+    kind is "long_option", "short_put", "call_spread" or "put_spread";
+    right ("call"/"put") is only read for "long_option". A spread settles at
+    its NET intrinsic, which is why its loss is capped at the wing distance.
+    """
+    if kind == "long_option":
+        intrinsic = (max(underlying_close - strike, 0.0) if right == "call"
+                     else max(strike - underlying_close, 0.0))
+        pnl = (intrinsic - entry_premium) * contract_multiplier * qty
+        return pnl, intrinsic > 0
+    if kind == "short_put":
+        intrinsic = max(strike - underlying_close, 0.0)
+        pnl = (entry_premium - intrinsic) * contract_multiplier * qty
+        return pnl, intrinsic > 0
+    if wing_strike is None:
+        raise ValueError(f"{kind} needs a wing_strike")
+    if kind == "call_spread":
+        net_intrinsic = (max(underlying_close - strike, 0.0)
+                         - max(underlying_close - wing_strike, 0.0))
+    elif kind == "put_spread":
+        net_intrinsic = (max(strike - underlying_close, 0.0)
+                         - max(wing_strike - underlying_close, 0.0))
+    else:
+        raise ValueError(f"unknown leg kind {kind!r}")
+    pnl = (entry_premium - net_intrinsic) * contract_multiplier * qty
+    return pnl, net_intrinsic > 0
+
+
 @dataclass
 class Leg:
     """One grid leg = one long option position (call or put per cluster side)."""

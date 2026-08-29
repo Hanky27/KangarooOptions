@@ -21,7 +21,7 @@
 
 """Self-tests of the Kangaroo Options core. Run: python test_kangaroo_core.py"""
 
-from kangaroo_core import KangarooCore
+from kangaroo_core import KangarooCore, settlement_pnl
 
 
 def make_core(**overrides) -> KangarooCore:
@@ -92,6 +92,68 @@ def test_cluster_profit_and_take_profit():
     assert core.check_close(19.99, 100.0, 100.02) is False
     # exactly at threshold is NOT a close (original: strictly greater)
     assert core.check_close(20.0, 100.0, 100.02) is False
+
+
+def test_put_spread_settles_otm_with_the_full_credit():
+    # short 700 put / wing 695, underlying closes at 710: both worthless
+    pnl, itm = settlement_pnl("put_spread", "put", 700.0, 695.0,
+                              entry_premium=1.20, qty=2, underlying_close=710.0)
+    assert pnl == 1.20 * 100 * 2, pnl
+    assert itm is False
+
+
+def test_put_spread_loss_is_capped_at_the_wing_distance():
+    # underlying crashes to 600: net intrinsic = 100 - 95 = 5 = the width
+    pnl, itm = settlement_pnl("put_spread", "put", 700.0, 695.0,
+                              entry_premium=1.20, qty=2, underlying_close=600.0)
+    assert pnl == (1.20 - 5.0) * 100 * 2, pnl
+    assert itm is True
+    # deeper does NOT lose more - that is the point of the wing
+    deeper, _ = settlement_pnl("put_spread", "put", 700.0, 695.0,
+                               entry_premium=1.20, qty=2, underlying_close=400.0)
+    assert deeper == pnl
+
+
+def test_call_spread_mirrors_the_put_spread():
+    # short 700 call / wing 705, underlying at 710 -> net intrinsic 10 - 5 = 5
+    pnl, itm = settlement_pnl("call_spread", "call", 700.0, 705.0,
+                              entry_premium=1.20, qty=2, underlying_close=710.0)
+    assert pnl == (1.20 - 5.0) * 100 * 2, pnl
+    assert itm is True
+    otm, itm2 = settlement_pnl("call_spread", "call", 700.0, 705.0,
+                               entry_premium=1.20, qty=2, underlying_close=690.0)
+    assert otm == 1.20 * 100 * 2 and itm2 is False
+
+
+def test_long_option_and_short_put_settlement():
+    # long call 700, close 712 -> intrinsic 12, paid 5.00
+    pnl, itm = settlement_pnl("long_option", "call", 700.0, None,
+                              entry_premium=5.00, qty=1, underlying_close=712.0)
+    assert pnl == (12.0 - 5.0) * 100 and itm is True
+    # worthless long call = total premium loss
+    pnl, itm = settlement_pnl("long_option", "call", 700.0, None,
+                              entry_premium=5.00, qty=1, underlying_close=690.0)
+    assert pnl == -5.00 * 100 and itm is False
+    # cash-secured short put 700, close 690 -> assigned 10 against 3.00 credit
+    pnl, itm = settlement_pnl("short_put", "put", 700.0, None,
+                              entry_premium=3.00, qty=1, underlying_close=690.0)
+    assert pnl == (3.00 - 10.0) * 100 and itm is True
+
+
+def test_settlement_rejects_an_unknown_kind_and_a_missing_wing():
+    for bad in ("butterfly", "iron_condor"):
+        try:
+            settlement_pnl(bad, "put", 700.0, 695.0, 1.0, 1, 700.0)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{bad} must not settle silently")
+    try:
+        settlement_pnl("put_spread", "put", 700.0, None, 1.0, 1, 700.0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a spread without a wing must fail loud")
 
 
 def test_sunk_pot_counts_towards_the_take_profit():
