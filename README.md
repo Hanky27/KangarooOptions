@@ -51,11 +51,20 @@ Trigger math always runs on the underlying quote, never on option premiums.
 
 The configuration is the winner of an 11-run backtest sweep (SPY,
 2024-02..2026-08, real Alpaca option prices, daily resolution): the
-put-credit-spread grid made **+34,484 USD** at **-2,721 USD** max drawdown
-with a **2,000 USD** margin peak, while every long-option variant of the
-same grid was negative and the Mode1 short side lost money in every
-measured style (see `backtest_options.py`; window caveat: no extended bear
-market in the data, marks are trade closes without spread costs).
+put-credit-spread grid was the only account-sized profitable variant, while
+every long-option variant of the same grid was negative and the Mode1 short
+side lost money in every measured style (see `backtest_options.py`; window
+caveat: no extended bear market in the data, marks are trade closes without
+spread costs).
+
+**Corrected 2026-08-29.** The simulator refreshed the protective wing's mark
+only for CALL spreads, so every PUT spread was valued against a wing frozen
+at its entry price. Differential test (one line changed, same data): the
+call-only run is bit-identical, the put-only run drops from **+34,484 USD**
+to **+2,688 USD** (max drawdown -2,721 -> -2,954 USD, margin peak unchanged
+at 2,000 USD). All put-spread figures published before that date are
+inflated; the parameter set has not been re-tuned against the corrected
+numbers yet.
 
 Deliberately **not** ported from the original: Mode1/Mode2/Mode3,
 Freeze/Unfreeze, hedging/netting order modes, grid close, PID factors,

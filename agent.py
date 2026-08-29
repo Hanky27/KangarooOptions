@@ -21,11 +21,18 @@
 
 """Kangaroo Options agent - put-credit-spread grid on Alpaca paper trading.
 
-Configuration chosen from the 11-run backtest sweep of 2026-08-28 (SPY,
+Configuration chosen from the backtest sweep of 2026-08-28 (SPY,
 2024-02..2026-08, real Alpaca option prices): the PUT-ONLY grid selling PUT
-CREDIT SPREADS was the only account-sized profitable variant (+34,484 USD,
-max drawdown -2,721 USD, margin peak 2,000 USD); every long-option variant
-was negative and the Mode1 short side lost money in every measured style.
+CREDIT SPREADS was the only account-sized profitable variant; every
+long-option variant was negative and the Mode1 short side lost money in
+every measured style.
+
+RE-MEASURED 2026-08-29 after the wing-mark defect fix (backtest_options.py
+marked put-spread wings at their ENTRY price for the whole leg life, which
+inflated every put-spread run): put-only +2,688 USD at -2,954 USD max
+drawdown, margin peak 2,000 USD (was +34,484 / -2,721 before the fix).
+Call-only is unaffected by the defect at -5,298 USD. The parameter set has
+NOT been re-tuned against the corrected numbers yet.
 
 Strategy per leg: SELL the ATM put, BUY a protective put ~5 $ lower (width
 probed over configured candidates) - one mleg LIMIT order at a marketable

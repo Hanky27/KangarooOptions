@@ -21,7 +21,10 @@
 
 """Stage-2 edge check: Kangaroo grid with REAL option prices (Alpaca data).
 
-Daily-resolution simulation of the Kangaroo grid on SPY in two styles:
+Simulation of the Kangaroo grid on SPY at daily OR hourly resolution
+(--timeframe 1Day/1Hour; [HOURLY 29.08.2026] - hourly runs key every mark by
+the bar's full UTC timestamp and settle expiries on the last bar of the
+expiry day), in two styles:
 
   long_options   Variant A: long CALLS (long cluster) / long PUTS (short
                  cluster), buy to open. Expiry = let legs expire (settle at
@@ -75,7 +78,9 @@ DEFAULT_PARAMS = dict(rebuy_1st_pct=1.2, rebuy_pct=0.10, tp_pct=0.10,
 
 CLI_PATH = "C:/Users/HMz/Documents/Source/AlpacaTools/cli/alpaca.exe"
 ENV_FILE = "C:/Users/HMz/Documents/Source/McpServer/alpaca-mcp-server/dist/env.txt"
-CACHE_DIR = "data/option_bars"
+# [HOURLY 29.08.2026] One cache dir per bar resolution - a 1Day close keyed by
+# date and a 1Hour close keyed by full timestamp must never share a file.
+CACHE_DIRS = {"1Day": "data/option_bars", "1Hour": "data/option_bars_1h"}
 
 SPREAD_WIDTHS = (5, 6, 4, 7, 3, 8, 10)   # credit-spread wing probes, $ from short strike
 
@@ -96,11 +101,17 @@ def _cli_env() -> dict:
 _ENV = None
 
 
-def fetch_option_closes(occ: str, start: str, end: str) -> dict[str, float]:
-    """Daily close per date for one OCC contract, cached on disk."""
+def fetch_option_closes(occ: str, start: str, end: str,
+                        timeframe: str = "1Day") -> dict[str, float]:
+    """Close per bar stamp for one OCC contract, cached on disk.
+
+    Key format follows the resolution: 1Day -> "YYYY-MM-DD" (unchanged),
+    1Hour -> the bar's full UTC timestamp as Alpaca returns it
+    ("YYYY-MM-DDTHH:00:00Z"). start/end stay DATE strings either way."""
     global _ENV
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    path = os.path.join(CACHE_DIR, f"{occ}.json")
+    cache_dir = CACHE_DIRS[timeframe]
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, f"{occ}.json")
     if os.path.isfile(path):
         with open(path, "r", encoding="utf-8") as fh:
             return json.load(fh)
@@ -108,7 +119,7 @@ def fetch_option_closes(occ: str, start: str, end: str) -> dict[str, float]:
         _ENV = _cli_env()
     proc = subprocess.run(
         [CLI_PATH, "data", "option", "bars", "--symbols", occ,
-         "--timeframe", "1Day", "--start", start, "--end", end,
+         "--timeframe", timeframe, "--start", start, "--end", end,
          "--limit", "1000", "-q"],
         capture_output=True, text=True, env=_ENV)
     if proc.returncode != 0:
@@ -118,7 +129,10 @@ def fetch_option_closes(occ: str, start: str, end: str) -> dict[str, float]:
     if isinstance(body, dict) and body.get("error"):
         raise RuntimeError(f"option bars {occ}: {body['error']}")
     bars = (body.get("bars") or {}).get(occ) or []
-    closes = {b["t"][:10]: b["c"] for b in bars}
+    if timeframe == "1Day":
+        closes = {b["t"][:10]: b["c"] for b in bars}
+    else:
+        closes = {b["t"]: b["c"] for b in bars}
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(closes, fh)
@@ -131,15 +145,17 @@ def occ_symbol(underlying: str, expiry: date, right: str, strike: int) -> str:
             f"{'C' if right == 'call' else 'P'}{strike * 1000:08d}")
 
 
-def pick_contract(underlying: str, entry_day: str, right: str, close: float,
-                  dte_min: int, dte_max: int,
-                  last_day: str) -> tuple[str, date, float] | None:
+def pick_contract(underlying: str, entry_stamp: str, right: str, close: float,
+                  dte_min: int, dte_max: int, last_day: str,
+                  timeframe: str = "1Day") -> tuple[str, date, float] | None:
     """Nearest weekday expiration in the DTE window, strike nearest to the
     close (probed +-2 around the rounded strike). Returns (occ, expiry,
-    entry_close) of the first candidate that traded on the entry day.
-    Fetch windows are capped at last_day: Alpaca rejects historical requests
-    whose end includes the CURRENT day with 403 'OPRA agreement is not
-    signed' (measured 2026-08-28)."""
+    entry_close) of the first candidate that traded on the entry bar.
+    entry_stamp is the bar key ("YYYY-MM-DD" daily, full timestamp hourly);
+    CLI fetch windows always use its DATE part. Fetch windows are capped at
+    last_day: Alpaca rejects historical requests whose end includes the
+    CURRENT day with 403 'OPRA agreement is not signed' (measured 2026-08-28)."""
+    entry_day = entry_stamp[:10]
     d0 = date.fromisoformat(entry_day)
     base = round(close)
     for dte in range(dte_min, dte_max + 1):
@@ -149,20 +165,22 @@ def pick_contract(underlying: str, entry_day: str, right: str, close: float,
         for strike in (base, base - 1, base + 1, base - 2, base + 2):
             occ = occ_symbol(underlying, expiry, right, strike)
             closes = fetch_option_closes(
-                occ, entry_day, min(expiry.isoformat(), last_day))
-            if entry_day in closes:
-                return occ, expiry, closes[entry_day]
+                occ, entry_day, min(expiry.isoformat(), last_day), timeframe)
+            if entry_stamp in closes:
+                return occ, expiry, closes[entry_stamp]
     return None
 
 
-def pick_spread(underlying: str, entry_day: str, right: str, close: float,
-                dte_min: int, dte_max: int, last_day: str):
+def pick_spread(underlying: str, entry_stamp: str, right: str, close: float,
+                dte_min: int, dte_max: int, last_day: str,
+                timeframe: str = "1Day"):
     """Credit spread: ATM short leg + protective wing (above the short
     strike for calls, below for puts). Iterates expiries AND wing widths -
     a missing wing at one expiry moves on to the next candidate instead of
     aborting. Returns (occ_s, strike_s, closes_s, occ_w, strike_w, closes_w,
-    expiry) of the first candidate whose both legs traded on the entry day
+    expiry) of the first candidate whose both legs traded on the entry bar
     with a positive net credit, or None."""
+    entry_day = entry_stamp[:10]
     d0 = date.fromisoformat(entry_day)
     base = round(close)
     sign = 1 if right == "call" else -1
@@ -173,16 +191,16 @@ def pick_spread(underlying: str, entry_day: str, right: str, close: float,
         for strike in (base, base - 1, base + 1, base - 2, base + 2):
             occ_s = occ_symbol(underlying, expiry, right, strike)
             closes_s = fetch_option_closes(
-                occ_s, entry_day, min(expiry.isoformat(), last_day))
-            if entry_day not in closes_s:
+                occ_s, entry_day, min(expiry.isoformat(), last_day), timeframe)
+            if entry_stamp not in closes_s:
                 continue
             for width in SPREAD_WIDTHS:
                 strike_w = strike + sign * width
                 occ_w = occ_symbol(underlying, expiry, right, strike_w)
                 closes_w = fetch_option_closes(
-                    occ_w, entry_day, min(expiry.isoformat(), last_day))
-                if (entry_day in closes_w
-                        and closes_s[entry_day] - closes_w[entry_day] > 0):
+                    occ_w, entry_day, min(expiry.isoformat(), last_day), timeframe)
+                if (entry_stamp in closes_w
+                        and closes_s[entry_stamp] - closes_w[entry_stamp] > 0):
                     return (occ_s, strike, closes_s,
                             occ_w, strike_w, closes_w, expiry)
     return None
@@ -192,14 +210,37 @@ def pick_spread(underlying: str, entry_day: str, right: str, close: float,
 
 def run(bars: list[dict], params: dict, dte_min: int, dte_max: int,
         underlying: str = "SPY", sma: dict[str, float] | None = None,
-        style: str = "long_options", regime: str = "mode1") -> dict:
+        style: str = "long_options", regime: str = "mode1",
+        cost_usd: float = 0.0, timeframe: str = "1Day",
+        on_day=None, on_cluster=None) -> dict:
+    """cost_usd: execution cost in USD per spread/contract per EXECUTION -
+    charged once at every leg open and once at every TP close; an expired
+    leg has no closing trade and therefore no exit cost. The take-profit
+    TRIGGER stays cost-free (the original grid knows no costs); the costs
+    reduce the booked cluster results.
+
+    timeframe [HOURLY 29.08.2026]: "1Day" (unchanged behaviour, bar key =
+    date) or "1Hour" (bar key = full UTC timestamp; marks, entries and TP
+    checks run per hour bar; expiry settles on the LAST bar of the expiry
+    day, which on 1Day is the day bar itself - one code path, REGEL 0.6/0.12).
+
+    on_day(index, total, stamp, realized_total, open_mark): read-only
+    observer called once per processed bar (drives the GUI equity stream).
+    on_cluster(cluster_dict): read-only observer called at every cluster
+    end with the row just appended to the result."""
     core = KangarooCore(**params)
     mult = core.contract_multiplier
     last_day = bars[-1]["t"][:10]
+    daily = timeframe == "1Day"
 
     leg_meta: dict[str, dict] = {}
     sunk_pot = 0.0
     cluster_start = None
+    # Underlying close when the cluster's first leg opened. Reported per
+    # cluster so the GUI can place its trade markers on a real level of the
+    # underlying axis - an option premium (or a 0) on that axis drags the
+    # chart's y-fit to meaningless bounds.
+    cluster_start_price = None
     clusters = []
     equity = []
     realized_total = 0.0
@@ -254,16 +295,18 @@ def run(bars: list[dict], params: dict, dte_min: int, dte_max: int,
             return abs(meta["wing_strike"] - meta["strike"]) * mult * leg.qty
         return 0.0
 
-    def end_cluster(kind: str, day: str, result: float,
-                    legs_at_end: int) -> None:
-        nonlocal sunk_pot, cluster_start, realized_total
+    def end_cluster(kind: str, stamp: str, result: float,
+                    legs_at_end: int, close_price: float) -> None:
+        nonlocal sunk_pot, cluster_start, cluster_start_price, realized_total
         realized_total += result
         clusters.append({
             "cluster_id": core.cluster_id,
             "direction": "long" if core.is_long else "short",
-            "start": cluster_start, "end": day, "end_kind": kind,
+            "start": cluster_start, "end": stamp, "end_kind": kind,
             "legs_at_end": legs_at_end,
             "result_usd": round(result, 2),
+            "start_price": cluster_start_price,
+            "end_price": round(close_price, 4),
         })
         if kind == "tp" and regime == "mode1":
             core.on_cluster_closed()          # original Mode1 toggle
@@ -272,68 +315,81 @@ def run(bars: list[dict], params: dict, dte_min: int, dte_max: int,
             core.cluster_id += 1
         sunk_pot = 0.0
         cluster_start = None
+        cluster_start_price = None
+        if on_cluster is not None:
+            on_cluster(clusters[-1])
 
-    def open_leg(day: str, close: float, qty: int) -> None:
-        nonlocal cluster_start
+    def open_leg(stamp: str, close: float, qty: int) -> None:
+        nonlocal cluster_start, cluster_start_price, sunk_pot
+        sunk_pot -= cost_usd * qty
         if style == "long_options":
             right = "call" if core.is_long else "put"
-            picked = pick_contract(underlying, day, right, close,
-                                   dte_min, dte_max, last_day)
+            picked = pick_contract(underlying, stamp, right, close,
+                                   dte_min, dte_max, last_day, timeframe)
             if picked is None:
-                raise RuntimeError(f"no tradable {right} on {day}")
+                raise RuntimeError(f"no tradable {right} on {stamp}")
             occ, expiry, entry_close = picked
             if not core.legs:
-                cluster_start = day
+                cluster_start = stamp
+                cluster_start_price = round(close, 4)
             core.add_leg(occ, qty, close, entry_close)
             leg_meta[occ] = {
                 "kind": "long_option", "right": right,
                 "expiry": expiry.isoformat(), "strike": int(occ[-8:]) / 1000.0,
                 "closes": fetch_option_closes(
-                    occ, day, min(expiry.isoformat(), last_day)),
+                    occ, stamp[:10], min(expiry.isoformat(), last_day), timeframe),
                 "last_close": entry_close,
             }
             stats["premium_gross"] += entry_close * mult * qty
         elif style == "short_premium" and core.is_long:  # cash-secured put
-            picked = pick_contract(underlying, day, "put", close,
-                                   dte_min, dte_max, last_day)
+            picked = pick_contract(underlying, stamp, "put", close,
+                                   dte_min, dte_max, last_day, timeframe)
             if picked is None:
-                raise RuntimeError(f"no tradable put on {day}")
+                raise RuntimeError(f"no tradable put on {stamp}")
             occ, expiry, entry_close = picked
             if not core.legs:
-                cluster_start = day
+                cluster_start = stamp
+                cluster_start_price = round(close, 4)
             core.add_leg(occ, qty, close, entry_close)   # credit received
             leg_meta[occ] = {
                 "kind": "short_put", "right": "put",
                 "expiry": expiry.isoformat(), "strike": int(occ[-8:]) / 1000.0,
                 "closes": fetch_option_closes(
-                    occ, day, min(expiry.isoformat(), last_day)),
+                    occ, stamp[:10], min(expiry.isoformat(), last_day), timeframe),
                 "last_close": entry_close,
             }
             stats["premium_gross"] += entry_close * mult * qty
         else:                                    # credit-spread leg
             right = "put" if core.is_long else "call"
-            picked = pick_spread(underlying, day, right, close,
-                                 dte_min, dte_max, last_day)
+            picked = pick_spread(underlying, stamp, right, close,
+                                 dte_min, dte_max, last_day, timeframe)
             if picked is None:
                 raise RuntimeError(
-                    f"no tradable {right} credit spread on {day}")
+                    f"no tradable {right} credit spread on {stamp}")
             occ_s, strike_s, closes_s, occ_w, strike_w, closes_w, expiry = picked
-            credit = closes_s[day] - closes_w[day]
+            credit = closes_s[stamp] - closes_w[stamp]
             if not core.legs:
-                cluster_start = day
+                cluster_start = stamp
+                cluster_start_price = round(close, 4)
             core.add_leg(occ_s, qty, close, credit)      # net credit
             leg_meta[occ_s] = {
                 "kind": f"{right}_spread", "right": right,
                 "expiry": expiry.isoformat(), "strike": float(strike_s),
                 "wing_strike": float(strike_w), "wing_occ": occ_w,
-                "closes": closes_s, "last_close": closes_s[day],
-                "wing_closes": closes_w, "wing_last_close": closes_w[day],
+                "closes": closes_s, "last_close": closes_s[stamp],
+                "wing_closes": closes_w, "wing_last_close": closes_w[stamp],
             }
             stats["premium_gross"] += credit * mult * qty
         stats["legs_opened"] += 1
 
-    for bar in bars:
+    total_bars = len(bars)
+    for bar_index, bar in enumerate(bars):
         day = bar["t"][:10]
+        # bar key: date on 1Day (unchanged), full timestamp on 1Hour
+        stamp = day if daily else bar["t"]
+        # expiry settles on the day's LAST bar (on 1Day that IS the bar)
+        last_bar_of_day = (bar_index + 1 == total_bars
+                           or bars[bar_index + 1]["t"][:10] != day)
         range_pct = (bar["h"] - bar["l"]) / bar["l"] * 100.0
         if range_pct > RANGE_BLOWOUT_PCT:
             if day in KNOWN_DEFECT_DAYS:
@@ -342,39 +398,44 @@ def run(bars: list[dict], params: dict, dte_min: int, dte_max: int,
             raise RuntimeError(f"range blowout on {day}: {range_pct:.1f} %")
         close = bar["c"]
 
-        # 1) expiry settlements
+        # 1) expiry settlements (at the close of the expiry day, both modes)
         if core.legs:
             surviving = []
             for leg in core.legs:
-                if day >= leg_meta[leg.option_symbol]["expiry"]:
+                expiry = leg_meta[leg.option_symbol]["expiry"]
+                if day > expiry or (day == expiry and last_bar_of_day):
                     sunk_pot += leg_settle(leg, close)
                 else:
                     surviving.append(leg)
             core.legs[:] = surviving
             if not core.legs and sunk_pot != 0.0:
-                end_cluster("expired", day, sunk_pot, 0)
+                end_cluster("expired", stamp, sunk_pot, 0, close)
 
         # 2) marks + take-profit on OPEN legs only
         closed_today = False
         if core.legs:
             for leg in core.legs:
                 meta = leg_meta[leg.option_symbol]
-                if day in meta["closes"]:
-                    meta["last_close"] = meta["closes"][day]
+                if stamp in meta["closes"]:
+                    meta["last_close"] = meta["closes"][stamp]
                 else:
                     stats["stale_marks"] += 1
-                if meta["kind"] == "call_spread":
-                    if day in meta["wing_closes"]:
-                        meta["wing_last_close"] = meta["wing_closes"][day]
+                # BOTH spread kinds carry a protective wing whose mark must be
+                # refreshed - leg_pnl() reads wing_last_close for either kind.
+                if meta["kind"].endswith("_spread"):
+                    if stamp in meta["wing_closes"]:
+                        meta["wing_last_close"] = meta["wing_closes"][stamp]
                     else:
                         stats["stale_marks"] += 1
             open_pnl = sum(leg_pnl(l) for l in core.legs)
             if core.check_close(open_pnl, close, close):
                 stats["legs_sold_tp"] += len(core.legs)
-                end_cluster("tp", day, sunk_pot + open_pnl, len(core.legs))
+                exit_cost = cost_usd * sum(l.qty for l in core.legs)
+                end_cluster("tp", stamp, sunk_pot + open_pnl - exit_cost,
+                            len(core.legs), close)
                 closed_today = True
 
-        # 3) rebuy (never on the day of a close - original ordering)
+        # 3) rebuy (never on the bar of a close - original ordering)
         if not closed_today:
             skip_open = False
             if not core.legs and regime in ("sma200", "sma200_flat"):
@@ -389,19 +450,23 @@ def run(bars: list[dict], params: dict, dte_min: int, dte_max: int,
             if not skip_open:
                 qty = core.check_rebuy(close, close)
                 if qty:
-                    open_leg(day, close, qty)
+                    open_leg(stamp, close, qty)
 
         margin = sum(leg_margin(l) for l in core.legs)
         stats["max_margin"] = max(stats["max_margin"], margin)
         open_mark = (sunk_pot + sum(leg_pnl(l) for l in core.legs)
                      if core.legs else 0.0)
-        equity.append((day, realized_total, open_mark))
+        equity.append((stamp, realized_total, open_mark))
+        if on_day is not None:
+            on_day(bar_index, total_bars, stamp, realized_total, open_mark)
 
     open_book = None
     if core.legs or sunk_pot:
         open_book = {
             "direction": "long" if core.is_long else "short",
             "start": cluster_start, "legs": core.invest_count,
+            "start_price": cluster_start_price,
+            "last_price": round(bars[-1]["c"], 4),
             "mark_usd": round(equity[-1][2], 2),
         }
     return {"clusters": clusters, "equity": equity, "stats": stats,
@@ -446,6 +511,9 @@ def summarize(result: dict) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bars", default="data/spy_daily.json")
+    parser.add_argument("--underlying", default="SPY")
+    parser.add_argument("--cost_usd", type=float, default=0.0,
+                        help="execution cost per spread per execution (USD)")
     parser.add_argument("--start", default="2024-02-01")
     parser.add_argument("--dte-min", type=int, default=4)
     parser.add_argument("--dte-max", type=int, default=10)
@@ -456,9 +524,26 @@ def main() -> None:
     parser.add_argument("--regime",
                         choices=["mode1", "same", "sma200", "sma200_flat"],
                         default="mode1")
+    parser.add_argument("--timeframe", choices=["1Day", "1Hour"],
+                        default="1Day",
+                        help="bar resolution; 1Hour needs an hourly --bars "
+                             "store and forbids sma regimes (their SMA is a "
+                             "200-DAY average)")
     parser.add_argument("--out", default="data")
+
+    def _bool_arg(v: str) -> bool:
+        # argparse's type=bool turns EVERY non-empty string (even "False")
+        # into True - a silent-wrong trap. Parse explicitly, fail loud.
+        s = str(v).strip().lower()
+        if s in ("true", "1", "yes", "on"):
+            return True
+        if s in ("false", "0", "no", "off"):
+            return False
+        raise argparse.ArgumentTypeError(f"expected true/false, got {v!r}")
+
     for key, val in DEFAULT_PARAMS.items():
-        parser.add_argument(f"--{key}", type=type(val), default=val)
+        typ = _bool_arg if isinstance(val, bool) else type(val)
+        parser.add_argument(f"--{key}", type=typ, default=val)
     args = parser.parse_args()
 
     with open(args.bars, "r", encoding="utf-8") as fh:
@@ -475,8 +560,14 @@ def main() -> None:
     print(f"params: {params}  dte=[{args.dte_min},{args.dte_max}]  "
           f"style={args.style}  regime={args.regime}  days={len(bars)}")
 
+    if args.timeframe == "1Hour" and args.regime in ("sma200", "sma200_flat"):
+        raise SystemExit("sma200 regimes are defined on the 200-DAY average; "
+                         "an hourly bar store would silently turn it into a "
+                         "200-hour one - not wired (fail loud).")
     result = run(bars, params, args.dte_min, args.dte_max,
-                 sma=sma, style=args.style, regime=args.regime)
+                 underlying=args.underlying, sma=sma, style=args.style,
+                 regime=args.regime, cost_usd=args.cost_usd,
+                 timeframe=args.timeframe)
     summarize(result)
 
     os.makedirs(args.out, exist_ok=True)
@@ -484,7 +575,7 @@ def main() -> None:
     with open(path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=[
             "cluster_id", "direction", "start", "end", "end_kind",
-            "legs_at_end", "result_usd"])
+            "legs_at_end", "result_usd", "start_price", "end_price"])
         writer.writeheader()
         writer.writerows(result["clusters"])
     print(f"clusters written: {path}")

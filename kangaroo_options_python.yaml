@@ -1,0 +1,132 @@
+# MIT License
+# Copyright (c) 2026 Heinrich Munz
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+# Kangaroo Options - put-credit-spread grid (QuantroTrader GUI wiring).
+# Entry point: run_engine.py -> backtest_options.run (the same simulator the
+# research CLI uses). Defaults = the winning configuration of the 11-run
+# backtest sweep of 2026-08-28 (put-only put credit spreads on SPY).
+bot: kangaroo_options
+
+# --- Engine wiring (read by the QuantroTrader GUI toolbar) ---------------
+engine: python
+# Alpaca is a full BacktestingCache provider since 2026-08-28 (chart bars,
+# date bounds via get_earliest_date --provider alpaca). The toolbar TF is
+# the engine's RESOLUTION switch ([HOURLY 29.08.2026]): Day = EOD grid on
+# the daily store (bars_file), Hour = hourly grid on Alpaca 1Hour bars
+# (underlying store auto-fetched to data/<underlying>_1h.json, option marks
+# from 1Hour option bars). Any other TF fails loud.
+data_source: Alpaca/SPY/d1
+broker: Alpaca
+symbol: SPY
+timeframe: d1
+starting_capital: 100000
+
+parameters:
+
+  rebuy_1st_pct:
+    type: float
+    default: 1.2
+    range: [0.2, 3.0]
+    step: 0.1
+    description: "% underlying drop from the last leg's entry before the 1st rebuy (cluster has < 2 legs)."
+    group: grid
+
+  rebuy_pct:
+    type: float
+    default: 0.1
+    range: [0.02, 1.0]
+    step: 0.02
+    description: "% underlying drop for every further rebuy."
+    group: grid
+
+  tp_pct:
+    type: float
+    default: 0.1
+    range: [0.02, 1.0]
+    step: 0.02
+    description: "Take-profit threshold: cluster closes when its open P&L exceeds legs * initial_qty * 100 * (tp_pct% of the underlying close)."
+    group: grid
+
+  initial_qty:
+    type: int
+    default: 1
+    range: [1, 10]
+    step: 1
+    description: "Spreads of the first leg; later legs grow by 1.1^n."
+    group: grid
+
+  max_invest_count:
+    type: int
+    default: 20
+    range: [1, 30]
+    step: 1
+    description: "Hard cap of legs per cluster."
+    group: grid
+
+  dte_min:
+    type: int
+    default: 4
+    range: [1, 30]
+    step: 1
+    description: "Minimum days to expiration of a new leg's contracts."
+    group: contracts
+
+  dte_max:
+    type: int
+    default: 10
+    range: [2, 45]
+    step: 1
+    description: "Maximum days to expiration of a new leg's contracts."
+    group: contracts
+
+  style:
+    type: enum
+    default: short_premium_spreads
+    values: [short_premium_spreads, short_premium, long_options]
+    description: "Execution style: short_premium_spreads (put/call credit spreads), short_premium (cash-secured puts), long_options (variant A, negative in every measured run)."
+    group: strategy
+
+  direction:
+    type: enum
+    default: long
+    values: [long, short, mode1, sma200, sma200_flat]
+    description: "Market side, like the original Direction: long (put-spread grid), short (call-spread grid), mode1 (original toggle), sma200 (side from the 200-day SMA), sma200_flat (long above SMA, else flat). Measured SPY 02/2024-08/2026 (daily, after the 2026-08-29 wing-mark fix): long +2,688 / short -5,298 / mode1 +693 USD."
+    group: strategy
+
+  cost_usd:
+    type: float
+    default: 0.0
+    range: [0.0, 5.0]
+    step: 0.5
+    description: "Execution cost in USD per spread per execution (entry and TP close; expiry costs nothing)."
+    group: costs
+
+  underlying:
+    type: string
+    default: SPY
+    description: "Underlying symbol; its daily bars must exist as data/<underlying lowercase>_daily.json (see bars_file)."
+    group: meta
+
+  bars_file:
+    type: string
+    default: data/spy_daily.json
+    description: "Daily bar store (Alpaca CLI download), relative to the bot folder. Used for TF Day only - TF Hour auto-fetches data/<underlying>_1h.json."
+    group: meta
