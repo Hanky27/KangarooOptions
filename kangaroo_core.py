@@ -251,6 +251,16 @@ class KangarooCore:
     def restore(self, state: dict) -> None:
         """Restore cluster state from a to_dict() snapshot. Unknown or
         missing keys are an error - never guess a trading state."""
+        missing = [k for k in ("is_long", "cluster_id", "sunk_pot", "legs")
+                   if k not in state]
+        if missing:
+            raise KeyError(
+                f"cluster state is missing {', '.join(missing)}. A state "
+                f"file written before the sunk pot existed carries no "
+                f"record of what its settled legs realized; that number "
+                f"cannot be reconstructed and must not be assumed to be "
+                f"zero. Close the open cluster by hand, delete the state "
+                f"file, and let the agent start a fresh cluster.")
         self.is_long = bool(state["is_long"])
         self.cluster_id = int(state["cluster_id"])
         self.sunk_pot = float(state["sunk_pot"])

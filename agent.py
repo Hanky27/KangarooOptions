@@ -42,15 +42,23 @@ take-profit on the cluster's aggregated closeable P&L, direction never
 toggles (put-only).
 
 Loop per poll (close check first, never open in the same iteration):
-  0. expiry handling - legs whose expiration has passed are dropped (the
-     broker settles them; user rule 2026-08-28: let legs expire), and an
-     ASSIGNED underlying stock position is flattened immediately
-  1. market clock gate (outside regular hours: sample and wait)
-  2. underlying quote -> trigger math (never option premiums)
-  3. take-profit check on the OPEN legs' closeable P&L (buy back short at
-     ask, sell wing at bid); on TP close every spread, then restart the
-     grid in the same direction
-  4. rebuy check -> sell one new put credit spread
+  0. assignment gate - an ASSIGNED underlying stock position is flattened
+     at market before anything else, so no leg is settled while the stock
+     it produced is still on the books
+  1. expiry handling - a leg past its expiration is settled through
+     kangaroo_core.settlement_pnl against the underlying close of the
+     expiry day, and its realized USD goes into the cluster's SUNK POT
+     (user rule 2026-08-28: let legs expire). While an assignment is still
+     open the settlement is deferred rather than booked twice.
+  2. market clock gate (outside regular hours: sample and wait)
+  3. underlying quote -> trigger math (never option premiums)
+  4. take-profit check on the WHOLE cluster - open legs' closeable P&L
+     (buy back short at ask, sell wing at bid) PLUS the sunk pot, the same
+     comparison the simulator makes and the same shape as the original's
+     ClusterProfit = open positions + mClosedProfit. A cluster therefore
+     never takes profit while its total is negative. On TP every spread is
+     closed and the grid restarts in the same direction.
+  5. rebuy check -> sell one new put credit spread
 
 Orders: mleg LIMIT day orders (order form verified on the paper account
 2026-08-28). An order that does not fill within fill_requote_samples polls
@@ -74,7 +82,8 @@ from datetime import date, timedelta
 import yaml
 
 from alpaca_cli import AlpacaCli, AlpacaCliError
-from kangaroo_core import KangarooCore
+from fetch_alpaca_bars import fetch as fetch_bars
+from kangaroo_core import KangarooCore, settlement_pnl
 
 TERMINAL_BAD = {"canceled", "expired", "rejected", "done_for_day",
                 "stopped", "suspended", "replaced"}
@@ -316,7 +325,6 @@ class KangarooAgent:
             log(f"DRY-RUN would close cluster {self.core.cluster_id} "
                 f"({self.core.invest_count} legs)", quote_ts)
             return
-        realized = 0.0
         remaining = list(self.core.legs)
         for i, leg in enumerate(remaining):
             extra = self.leg_extras[leg.option_symbol]
@@ -339,11 +347,17 @@ class KangarooAgent:
                 return
             fill_s, fill_w = self._leg_fills(filled, leg.option_symbol,
                                              extra["wing_occ"])
-            realized += ((leg.entry_premium - (fill_s - fill_w))
-                         * self.core.contract_multiplier * leg.qty)
+            # Into the POT, not a local: when a later leg's close does not
+            # fill, this method returns with the cluster still alive, and
+            # the money already taken has to stay with it. In a local float
+            # it was dropped, and the next take-profit check then measured
+            # the surviving legs against a cluster total that had lost its
+            # realized part.
+            self.core.book_settled((leg.entry_premium - (fill_s - fill_w))
+                                   * self.core.contract_multiplier * leg.qty)
             self.core.legs.remove(leg)
             self.save_state()
-        ended = self.core.cluster_id
+        ended, realized = self.core.cluster_id, self.core.sunk_pot
         self.core.on_cluster_closed(toggle=False)   # put-only: no Mode1
         self.save_state()
         log(f"CLOSE cluster {ended}: realized {realized:.2f} USD "
@@ -352,22 +366,64 @@ class KangarooAgent:
 
     # --- gates -----------------------------------------------------------
 
+    def settlement_close(self, expiry: str) -> float:
+        """Underlying close of the expiry day - the price the expiring legs
+        settle against, exactly as the simulator does it. Fails loud when
+        the bar is missing: guessing a settlement price would silently move
+        the cluster's whole pot."""
+        bars = fetch_bars(self.underlying, "1Day", expiry, expiry)
+        if not bars:
+            raise AlpacaCliError(
+                f"no {self.underlying} daily bar for expiry {expiry} - "
+                f"cannot settle the expired leg(s); refusing to guess")
+        close = float(bars[-1]["c"])
+        if close <= 0:
+            raise AlpacaCliError(
+                f"{self.underlying} close on {expiry} is {close}")
+        return close
+
     def handle_expiries(self, clock_date: str) -> None:
-        """User rule: let legs expire. A leg whose expiration date has
-        passed was settled by the broker overnight - drop it here."""
+        """User rule: let legs expire. A leg past its expiration date was
+        settled by the broker overnight; book its realized USD into the
+        cluster's sunk pot through the SAME formula the simulator uses
+        (kangaroo_core.settlement_pnl), so the take-profit comparison here
+        and in the backtest run on the same number.
+
+        An ITM short put is ASSIGNED rather than cash-settled: the account
+        then holds stock, and booking an intrinsic settlement while that
+        position is open would count the same money twice. Settlement is
+        therefore deferred until the account is flat in the underlying -
+        assignment_gate flattens it on the next open poll."""
         expired = [l for l in self.core.legs
                    if clock_date > self.leg_extras[l.option_symbol]["expiry"]]
         if not expired:
             return
+        held = [p for p in self.cli.positions()
+                if p["symbol"] == self.underlying]
+        if held:
+            log(f"{len(expired)} expired leg(s) pending, but the account "
+                f"holds {held[0]['qty']} {self.underlying} from an "
+                f"assignment - settlement deferred until flat")
+            return
         for leg in expired:
+            extra = self.leg_extras[leg.option_symbol]
+            close = self.settlement_close(extra["expiry"])
+            pnl, itm = settlement_pnl(
+                "put_spread", "put", extra["strike"], extra["wing_strike"],
+                leg.entry_premium, leg.qty, close,
+                self.core.contract_multiplier)
+            self.core.book_settled(pnl)
             log(f"EXPIRED leg {leg.option_symbol} x{leg.qty} "
-                f"(settled by broker) - dropping from cluster")
+                f"{'ITM' if itm else 'OTM'} at {self.underlying} "
+                f"{close:.2f} on {extra['expiry']}: {pnl:+.2f} USD booked "
+                f"into cluster {self.core.cluster_id} "
+                f"(pot {self.core.sunk_pot:+.2f})")
             self.core.legs.remove(leg)
         if not self.core.legs:
-            ended = self.core.cluster_id
+            ended, booked = self.core.cluster_id, self.core.sunk_pot
             self.core.on_cluster_closed(toggle=False)
-            log(f"cluster {ended} fully expired - restarting put grid "
-                f"(cluster {self.core.cluster_id})")
+            log(f"cluster {ended} fully expired: {booked:+.2f} USD realized "
+                f"- restarting put grid (cluster {self.core.cluster_id})")
         self.save_state()
 
     def assignment_gate(self) -> None:
@@ -398,6 +454,12 @@ class KangarooAgent:
 
     def step(self) -> None:
         clock = self.cli.clock()
+        # Assignment BEFORE settlement: an assigned short put leaves stock
+        # in the account, and handle_expiries must not book an intrinsic
+        # settlement while that position is open. Flattening needs an open
+        # market; handle_expiries defers over the hours in between.
+        if clock["is_open"]:
+            self.assignment_gate()
         self.handle_expiries(clock["timestamp"][:10])
         if not clock["is_open"]:
             if self._market_was_open is not False:
@@ -409,7 +471,6 @@ class KangarooAgent:
             log(f"market open - next close {clock['next_close']} "
                 f"(clock {clock['timestamp']})")
             self._market_was_open = True
-        self.assignment_gate()
 
         quote = self.cli.stock_quote(self.underlying)
         spot_bid, spot_ask, quote_ts = quote["bp"], quote["ap"], quote["t"]
@@ -432,6 +493,10 @@ class KangarooAgent:
             f"options_approved_level={account['options_approved_level']} "
             f"options_trading_level={account['options_trading_level']}")
         self.load_state()
+        # Settle first, THEN reconcile: an expired leg is gone from the
+        # account, so reconcile would reject the state file it just read
+        # and the agent could never restart after a settlement failure.
+        self.handle_expiries(self.cli.clock()["timestamp"][:10])
         self.reconcile()
         log(f"agent start: put-credit-spread grid on {self.underlying}, "
             f"cluster {self.core.cluster_id}, legs={self.core.invest_count}, "
