@@ -44,8 +44,13 @@ expiry day), in two styles:
 Shared mechanics (ported from the original grid):
   - Decisions once per trading day at the CLOSE on the underlying's close.
   - Rebuy trigger and take-profit threshold from KangarooCore, unchanged.
-  - The take-profit check uses the OPEN legs' P&L only; settled (expired)
-    legs accumulate in the cluster's sunk pot, booked at cluster end.
+  - The take-profit check runs on the WHOLE cluster: open legs plus the
+    sunk pot of already-settled (expired) legs, mirroring the original's
+    ClusterProfit = open positions + mClosedProfit (Instance.cs:442,
+    tested at :618). The threshold is positive, so a cluster never takes
+    profit while its total is negative - a loss on settled legs has to be
+    earned back first. A cluster whose legs ALL expire still books that
+    pot; there is nothing left to hold on to.
   - Regime options at cluster BIRTH (running clusters are never touched):
       mode1        original blind toggle on TP close
       same         restart in the same direction after every cluster end
@@ -234,7 +239,6 @@ def run(bars: list[dict], params: dict, dte_min: int, dte_max: int,
     daily = timeframe == "1Day"
 
     leg_meta: dict[str, dict] = {}
-    sunk_pot = 0.0
     cluster_start = None
     # Underlying close when the cluster's first leg opened. Reported per
     # cluster so the GUI can place its trade markers on a real level of the
@@ -297,7 +301,7 @@ def run(bars: list[dict], params: dict, dte_min: int, dte_max: int,
 
     def end_cluster(kind: str, stamp: str, result: float,
                     legs_at_end: int, close_price: float) -> None:
-        nonlocal sunk_pot, cluster_start, cluster_start_price, realized_total
+        nonlocal cluster_start, cluster_start_price, realized_total
         realized_total += result
         clusters.append({
             "cluster_id": core.cluster_id,
@@ -308,20 +312,18 @@ def run(bars: list[dict], params: dict, dte_min: int, dte_max: int,
             "start_price": cluster_start_price,
             "end_price": round(close_price, 4),
         })
-        if kind == "tp" and regime == "mode1":
-            core.on_cluster_closed()          # original Mode1 toggle
-        else:
-            core.legs.clear()
-            core.cluster_id += 1
-        sunk_pot = 0.0
+        # Both paths go through the core so the cluster reset stays in ONE
+        # place - it also clears the sunk pot, which a hand-rolled
+        # legs.clear() here did not.
+        core.on_cluster_closed(toggle=(kind == "tp" and regime == "mode1"))
         cluster_start = None
         cluster_start_price = None
         if on_cluster is not None:
             on_cluster(clusters[-1])
 
     def open_leg(stamp: str, close: float, qty: int) -> None:
-        nonlocal cluster_start, cluster_start_price, sunk_pot
-        sunk_pot -= cost_usd * qty
+        nonlocal cluster_start, cluster_start_price
+        core.book_settled(-cost_usd * qty)
         if style == "long_options":
             right = "call" if core.is_long else "put"
             picked = pick_contract(underlying, stamp, right, close,
@@ -404,12 +406,12 @@ def run(bars: list[dict], params: dict, dte_min: int, dte_max: int,
             for leg in core.legs:
                 expiry = leg_meta[leg.option_symbol]["expiry"]
                 if day > expiry or (day == expiry and last_bar_of_day):
-                    sunk_pot += leg_settle(leg, close)
+                    core.book_settled(leg_settle(leg, close))
                 else:
                     surviving.append(leg)
             core.legs[:] = surviving
-            if not core.legs and sunk_pot != 0.0:
-                end_cluster("expired", stamp, sunk_pot, 0, close)
+            if not core.legs and core.sunk_pot != 0.0:
+                end_cluster("expired", stamp, core.sunk_pot, 0, close)
 
         # 2) marks + take-profit on OPEN legs only
         closed_today = False
@@ -431,7 +433,7 @@ def run(bars: list[dict], params: dict, dte_min: int, dte_max: int,
             if core.check_close(open_pnl, close, close):
                 stats["legs_sold_tp"] += len(core.legs)
                 exit_cost = cost_usd * sum(l.qty for l in core.legs)
-                end_cluster("tp", stamp, sunk_pot + open_pnl - exit_cost,
+                end_cluster("tp", stamp, core.sunk_pot + open_pnl - exit_cost,
                             len(core.legs), close)
                 closed_today = True
 
@@ -454,14 +456,14 @@ def run(bars: list[dict], params: dict, dte_min: int, dte_max: int,
 
         margin = sum(leg_margin(l) for l in core.legs)
         stats["max_margin"] = max(stats["max_margin"], margin)
-        open_mark = (sunk_pot + sum(leg_pnl(l) for l in core.legs)
+        open_mark = (core.sunk_pot + sum(leg_pnl(l) for l in core.legs)
                      if core.legs else 0.0)
         equity.append((stamp, realized_total, open_mark))
         if on_day is not None:
             on_day(bar_index, total_bars, stamp, realized_total, open_mark)
 
     open_book = None
-    if core.legs or sunk_pot:
+    if core.legs or core.sunk_pot:
         open_book = {
             "direction": "long" if core.is_long else "short",
             "start": cluster_start, "legs": core.invest_count,

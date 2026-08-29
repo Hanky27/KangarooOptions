@@ -94,6 +94,29 @@ def test_cluster_profit_and_take_profit():
     assert core.check_close(20.0, 100.0, 100.02) is False
 
 
+def test_sunk_pot_counts_towards_the_take_profit():
+    core = make_core()
+    core.add_leg("C1", 1, entry_underlying=100.0, entry_premium=1.00)
+    # threshold at spot 100 with one leg: 1 * 1 * 100 * 0.10% of 100 = 10 USD
+    assert core.check_close(10.01, 100.0, 100.02) is True
+    # a settled leg that lost 500 USD must be earned back first
+    core.book_settled(-500.0)
+    assert core.check_close(10.01, 100.0, 100.02) is False
+    assert core.check_close(510.0, 100.0, 100.02) is False
+    assert core.check_close(510.01, 100.0, 100.02) is True
+    # ... and a settled WIN counts the same way
+    core.book_settled(1000.0)
+    assert core.check_close(0.0, 100.0, 100.02) is True
+
+
+def test_cluster_close_resets_the_sunk_pot():
+    core = make_core()
+    core.add_leg("C1", 1, 100.0, 1.0)
+    core.book_settled(-250.0)
+    core.on_cluster_closed()
+    assert core.sunk_pot == 0.0
+
+
 def test_mode1_toggle_on_close():
     core = make_core()
     core.add_leg("C1", 1, 100.0, 1.0)

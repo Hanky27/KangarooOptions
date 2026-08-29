@@ -89,6 +89,12 @@ class KangarooCore:
         self.is_long = bool(start_long)   # True: call cluster, False: put cluster
         self.cluster_id = 1
         self.legs: list[Leg] = []
+        # Realized USD of legs that already left the cluster (expiry
+        # settlement, execution cost). The original has no such legs - FX
+        # positions never expire - but its ClusterProfit is likewise
+        # "open positions + already closed ones" (Instance.cs:442), so the
+        # take-profit test runs on the same total here.
+        self.sunk_pot = 0.0
 
     # --- state -----------------------------------------------------------
 
@@ -147,13 +153,20 @@ class KangarooCore:
             total += (bid - leg.entry_premium) * self.contract_multiplier * leg.qty
         return total
 
-    def check_close(self, cluster_profit_usd: float,
+    def check_close(self, open_pnl_usd: float,
                     spot_bid: float, spot_ask: float) -> bool:
         """Take-profit check, same shape as the original:
         close when ClusterProfit > InvestCount * InitialTargetCash with
         InitialTargetCash = initial_qty * multiplier * (tp_pct% of the
         underlying exit-side price). The multiplier maps '1 contract' to
         '100 underlying units', the option-world analogue of one FX lot unit.
+
+        ClusterProfit is the WHOLE cluster - the open legs' P&L plus
+        sunk_pot, mirroring `HedgePositions.Sum(Profit) + mClosedProfit`
+        (Instance.cs:442) tested at Instance.cs:618. Since the threshold is
+        positive, a cluster can never take profit while its total is
+        negative: a loss on already-settled legs must be earned back first.
+
         Note: long options carry delta < 1, so reaching the threshold needs
         more underlying movement than in the FX original - tp_pct is a
         tuning parameter, not a like-for-like carryover."""
@@ -162,7 +175,12 @@ class KangarooCore:
         spot_exit = spot_bid if self.is_long else spot_ask
         tp_value = spot_exit * self.tp_pct / 100.0
         threshold = self.invest_count * self.initial_qty * self.contract_multiplier * tp_value
-        return cluster_profit_usd > threshold
+        return open_pnl_usd + self.sunk_pot > threshold
+
+    def book_settled(self, amount_usd: float) -> None:
+        """Add realized USD of a leg that left the cluster (expiry
+        settlement, execution cost) to the cluster's sunk pot."""
+        self.sunk_pot += float(amount_usd)
 
     def on_cluster_closed(self, toggle: bool = True) -> None:
         """End the current cluster. toggle=True is the original Mode1
@@ -170,6 +188,7 @@ class KangarooCore:
         toggle=False and keeps its direction (backtests 2026-08-28: the
         Mode1 short side lost money in every measured style)."""
         self.legs.clear()
+        self.sunk_pot = 0.0
         if toggle:
             self.is_long = not self.is_long
         self.cluster_id += 1
@@ -180,6 +199,7 @@ class KangarooCore:
         return {
             "is_long": self.is_long,
             "cluster_id": self.cluster_id,
+            "sunk_pot": self.sunk_pot,
             "legs": [
                 {
                     "option_symbol": leg.option_symbol,
@@ -196,6 +216,7 @@ class KangarooCore:
         missing keys are an error - never guess a trading state."""
         self.is_long = bool(state["is_long"])
         self.cluster_id = int(state["cluster_id"])
+        self.sunk_pot = float(state["sunk_pot"])
         self.legs = [
             Leg(
                 option_symbol=str(leg["option_symbol"]),
