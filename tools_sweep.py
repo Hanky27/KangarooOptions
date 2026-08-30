@@ -49,7 +49,8 @@ import backtest_options as bt
 _SIGNAL_ENGINE = "C:/Users/HMz/Documents/Source/QuantroTrader"
 if _SIGNAL_ENGINE not in sys.path:
     sys.path.insert(0, _SIGNAL_ENGINE)
-from SignalEngine.optimizer.equity_shape import equity_linearity
+from SignalEngine.optimizer.equity_shape import (equity_linearity,
+                                                 linearity_factor)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRATCH = ("C:/Users/HMz/AppData/Local/Temp/claude/"
@@ -71,6 +72,11 @@ WINDOW_RANGE = {"2025": ("2025-01-01", "2025-12-31"),
                 # Ten trading days is far too short for a stable estimate -
                 # every number from it carries that caveat.
                 "2w": ("2026-08-14", "2026-08-27")}
+
+# Weight of the curve-shape multiplier in the combined objective. 1.0 is
+# the value the spec documents as the plain product (OPTIMIZE_SPEC.md:433
+# "fitness_shaped = fitness_ctrader * max(r, 0) ** equityLinearityExponent").
+LINEARITY_EXPONENT = 1.0
 
 _BARS: dict[tuple[str, str], list] = {}
 
@@ -156,12 +162,26 @@ def evaluate(**overrides) -> dict:
     asym = sum(abs(nets[f"{w}_long"] - nets[f"{w}_short"])
                for w in {k.rsplit("_", 1)[0] for k in nets})
     rs = [v["r"] for v in cells.values() if v["r"] is not None]
+    # "Straight AND profitable" is the house objective from REGEL 9.-1
+    # [EVEN-EQUITY]: fitness = profit * max(r, 0) ** exponent, with the
+    # multiplier taken from the same module as r itself. A cell whose curve
+    # falls contributes zero instead of flipping the sign of the sum, and a
+    # cell whose r is not measurable (too few clusters) is left out of the
+    # score and counted separately, never silently as zero.
+    shaped, unscored = 0.0, 0
+    for v in cells.values():
+        if v["r"] is None:
+            unscored += 1
+            continue
+        shaped += v["net"] * linearity_factor(v["r"], LINEARITY_EXPONENT)
     return {
         "params": overrides,
         "cells": cells,
         "r_min": round(min(rs), 4) if rs else None,
         "r_mean": round(sum(rs) / len(rs), 4) if rs else None,
         "net_total": sum(nets.values()),
+        "shaped": round(shaped),
+        "cells_without_r": unscored,
         "asymmetry": asym,
         "worst_dd": min(v["dd"] for v in cells.values()),
         "worst_cluster": min(v["worst"] for v in cells.values()),
@@ -176,7 +196,7 @@ def show(label: str, r: dict) -> None:
         f"{k.replace('_long', 'L').replace('_short', 'S')} {v['net']:+7,.0f}"
         f"(r{'  n/a' if v['r'] is None else f'{v[chr(114)]:+.2f}'})"
         for k, v in r["cells"].items())
-    print(f"{label:34s} r_min {str(r['r_min']):>7s} | net {r['net_total']:+8,.0f} "
+    print(f"{label:34s} SCORE {r['shaped']:+8,.0f} | r_min {str(r['r_min']):>7s} | net {r['net_total']:+8,.0f} "
           f"| schlechteste DD {r['worst_dd']:+8,.0f} | Asym {r['asymmetry']:7,.0f} "
           f"| Margin {r['max_margin']:6,.0f} | {cells}", flush=True)
 
