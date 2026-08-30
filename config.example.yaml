@@ -34,7 +34,7 @@ initial_qty: 1          # spreads of the first leg
 max_invest_count: 20    # hard cap of legs per cluster
 # Stop rebuying once the underlying ran this far (%) against the
 # cluster's first leg. 0 = off. Positions are never closed by it.
-max_adverse_pct: 0.0
+max_adverse_pct: 5.0
 
 # Spread selection: nearest expiration inside the DTE window, short strike
 # nearest to spot, wing = first width candidate that exists as a strike.

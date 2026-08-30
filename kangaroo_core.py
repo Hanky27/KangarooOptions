@@ -142,6 +142,11 @@ class KangarooCore:
         # "open positions + already closed ones" (Instance.cs:442), so the
         # take-profit test runs on the same total here.
         self.sunk_pot = 0.0
+        # Underlying reference of the cluster's FIRST leg. Fixed for the
+        # cluster's whole life: legs[0] is only the oldest leg still OPEN,
+        # and it moves forward every time a leg expires - an anchor that
+        # drifts with the very move it is supposed to measure.
+        self.cluster_anchor: float | None = None
 
     # --- state -----------------------------------------------------------
 
@@ -164,6 +169,8 @@ class KangarooCore:
                 entry_underlying: float, entry_premium: float) -> None:
         if qty < 1:
             raise ValueError("leg qty must be >= 1")
+        if not self.legs:
+            self.cluster_anchor = float(entry_underlying)
         self.legs.append(Leg(option_symbol, int(qty),
                              float(entry_underlying), float(entry_premium)))
 
@@ -187,8 +194,8 @@ class KangarooCore:
             return self.initial_qty
         if self.invest_count >= self.max_invest_count:
             return 0
-        if self.max_adverse_pct:
-            first = self.legs[0].entry_underlying
+        if self.max_adverse_pct and self.cluster_anchor:
+            first = self.cluster_anchor
             spot = spot_ask if self.is_long else spot_bid
             adverse = ((first - spot) if self.is_long else (spot - first))
             if adverse / first * 100.0 > self.max_adverse_pct:
@@ -247,6 +254,7 @@ class KangarooCore:
         Mode1 short side lost money in every measured style)."""
         self.legs.clear()
         self.sunk_pot = 0.0
+        self.cluster_anchor = None
         if toggle:
             self.is_long = not self.is_long
         self.cluster_id += 1
@@ -258,6 +266,7 @@ class KangarooCore:
             "is_long": self.is_long,
             "cluster_id": self.cluster_id,
             "sunk_pot": self.sunk_pot,
+            "cluster_anchor": self.cluster_anchor,
             "legs": [
                 {
                     "option_symbol": leg.option_symbol,
@@ -272,7 +281,8 @@ class KangarooCore:
     def restore(self, state: dict) -> None:
         """Restore cluster state from a to_dict() snapshot. Unknown or
         missing keys are an error - never guess a trading state."""
-        missing = [k for k in ("is_long", "cluster_id", "sunk_pot", "legs")
+        missing = [k for k in ("is_long", "cluster_id", "sunk_pot",
+                               "cluster_anchor", "legs")
                    if k not in state]
         if missing:
             raise KeyError(
@@ -285,6 +295,8 @@ class KangarooCore:
         self.is_long = bool(state["is_long"])
         self.cluster_id = int(state["cluster_id"])
         self.sunk_pot = float(state["sunk_pot"])
+        anchor = state["cluster_anchor"]
+        self.cluster_anchor = None if anchor is None else float(anchor)
         self.legs = [
             Leg(
                 option_symbol=str(leg["option_symbol"]),

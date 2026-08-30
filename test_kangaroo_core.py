@@ -84,6 +84,24 @@ def test_max_adverse_pct_stops_digging_but_keeps_the_cluster():
     assert core.check_close(1000.0, 94.0, 94.9) is True
 
 
+def test_max_adverse_anchor_does_not_drift_when_a_leg_expires():
+    """The anchor is the cluster's FIRST leg, not the oldest surviving one.
+    Legs expire during exactly the move the cap is meant to measure, so an
+    anchor taken from legs[0] would crawl along with it and let the grid
+    keep digging."""
+    core = make_core(max_adverse_pct=5.0)
+    core.add_leg("C1", 1, entry_underlying=100.0, entry_premium=1.0)
+    core.add_leg("C2", 1, entry_underlying=97.0, entry_premium=1.2)
+    assert core.cluster_anchor == 100.0
+    core.legs.pop(0)                      # leg 1 expires and leaves
+    assert core.cluster_anchor == 100.0, "the anchor must stay at 100"
+    # 95.0 is 5.0 % below the ANCHOR (blocked) but only 2.1 % below the
+    # oldest surviving leg at 97 - which would still have allowed a rebuy.
+    assert core.check_rebuy(94.0, 94.9) == 0
+    core.on_cluster_closed(toggle=False)
+    assert core.cluster_anchor is None, "a new cluster takes a new anchor"
+
+
 def test_max_adverse_pct_mirrors_for_the_short_side():
     core = make_core(start_long=False, max_adverse_pct=5.0)
     core.add_leg("P1", 1, entry_underlying=100.0, entry_premium=1.0)
