@@ -59,12 +59,18 @@ SCRATCH = ("C:/Users/HMz/AppData/Local/Temp/claude/"
 WINDOWS = {
     "2025": os.path.join(SCRATCH, "spy_1h_2025.json"),
     "2026": os.path.join(HERE, "data", "spy_1h.json"),
+    "2w": os.path.join(HERE, "data", "spy_1h.json"),
 }
 
 # Other underlyings are sliced out of their own hourly store, which
 # run_engine._ensure_hour_bars builds with the exchange-calendar filter.
 WINDOW_RANGE = {"2025": ("2025-01-01", "2025-12-31"),
-                "2026": ("2026-01-01", "2026-08-27")}
+                "2026": ("2026-01-01", "2026-08-27"),
+                # The last two trading weeks before the contest, i.e. the
+                # closest thing to the judged window (Mon 31.08 - Thu 03.09).
+                # Ten trading days is far too short for a stable estimate -
+                # every number from it carries that caveat.
+                "2w": ("2026-08-14", "2026-08-27")}
 
 _BARS: dict[tuple[str, str], list] = {}
 
@@ -76,6 +82,12 @@ def bars(window: str, symbol: str = "SPY") -> list:
             path = WINDOWS[window]
             with open(path, "r", encoding="utf-8") as fh:
                 rows = json.load(fh)["bars"]
+            # Date-bound, not file-bound: run_engine refetches this very
+            # store whenever the GUI is pointed at another range, so a
+            # window defined by "whatever the file holds" would silently
+            # change under a GUI run.
+            lo, hi = WINDOW_RANGE[window]
+            rows = [b for b in rows if lo <= b["t"][:10] <= hi]
         else:
             path = os.path.join(HERE, "data", f"{symbol.lower()}_1h.json")
             with open(path, "r", encoding="utf-8") as fh:
@@ -136,13 +148,13 @@ def evaluate(**overrides) -> dict:
     cell - the number that decides whether the account survives.
     """
     cells = {}
-    for window in ("2025", "2026"):
+    for window in overrides.pop("windows", ("2025", "2026")):
         for side, start_long in (("long", True), ("short", False)):
             cells[f"{window}_{side}"] = run_cell(window, start_long,
                                                  **overrides)
     nets = {k: v["net"] for k, v in cells.items()}
-    asym = (abs(nets["2025_long"] - nets["2025_short"])
-            + abs(nets["2026_long"] - nets["2026_short"]))
+    asym = sum(abs(nets[f"{w}_long"] - nets[f"{w}_short"])
+               for w in {k.rsplit("_", 1)[0] for k in nets})
     rs = [v["r"] for v in cells.values() if v["r"] is not None]
     return {
         "params": overrides,
@@ -159,14 +171,14 @@ def evaluate(**overrides) -> dict:
 
 
 def show(label: str, r: dict) -> None:
-    c = r["cells"]
-    print(f"{label:34s} r_min {str(r['r_min']):>7s} r_mean {str(r['r_mean']):>7s} | "
-          f"net {r['net_total']:+8,.0f} | schlechteste DD "
-          f"{r['worst_dd']:+8,.0f} | Asymmetrie {r['asymmetry']:8,.0f} | "
-          f"Margin {r['max_margin']:6,.0f} | "
-          f"25L {c['2025_long']['net']:+7,.0f} 25S {c['2025_short']['net']:+7,.0f} "
-          f"26L {c['2026_long']['net']:+7,.0f} 26S {c['2026_short']['net']:+7,.0f}",
-          flush=True)
+    """One line per parameter set, with every measured cell spelled out."""
+    cells = " ".join(
+        f"{k.replace('_long', 'L').replace('_short', 'S')} {v['net']:+7,.0f}"
+        f"(r{'  n/a' if v['r'] is None else f'{v[chr(114)]:+.2f}'})"
+        for k, v in r["cells"].items())
+    print(f"{label:34s} r_min {str(r['r_min']):>7s} | net {r['net_total']:+8,.0f} "
+          f"| schlechteste DD {r['worst_dd']:+8,.0f} | Asym {r['asymmetry']:7,.0f} "
+          f"| Margin {r['max_margin']:6,.0f} | {cells}", flush=True)
 
 
 if __name__ == "__main__":
