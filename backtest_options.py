@@ -122,9 +122,26 @@ def fetch_option_closes(occ: str, start: str, end: str,
     cache_dir = CACHE_DIRS[timeframe]
     os.makedirs(cache_dir, exist_ok=True)
     path = os.path.join(cache_dir, f"{occ}.json")
+    # The cache key is the CONTRACT, not the query range, so a file written
+    # for a later entry day does not cover an earlier one. A hit whose
+    # first day lies after the requested start is therefore too short: the
+    # entry stamp would be missing, pick_spread would reject a contract
+    # that does exist, and the run would take a different path. Measured
+    # 2026-08-30 on the 2026 long run: 2 of 274 cache hits were short that
+    # way, enough to move the result by a few hundred USD between runs with
+    # different cache states. Such a hit is refetched over the union and
+    # merged, so the file only ever grows.
+    cached = None
     if os.path.isfile(path):
         with open(path, "r", encoding="utf-8") as fh:
-            return json.load(fh)
+            cached = json.load(fh)
+        if not cached:
+            return cached
+        if start >= min(k[:10] for k in cached):
+            return cached
+        print(f"cache too short for {occ}: has from "
+              f"{min(k[:10] for k in cached)}, need from {start} - refetching",
+              flush=True)
     if _ENV is None:
         _ENV = _cli_env()
     args = [CLI_PATH, "data", "option", "bars", "--symbols", occ,
@@ -162,6 +179,10 @@ def fetch_option_closes(occ: str, start: str, end: str,
         closes = {b["t"][:10]: b["c"] for b in bars}
     else:
         closes = {b["t"]: b["c"] for b in bars}
+    if cached:
+        merged = dict(cached)
+        merged.update(closes)
+        closes = merged
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(closes, fh)
