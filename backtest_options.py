@@ -202,9 +202,13 @@ def pick_contract(underlying: str, entry_stamp: str, right: str, close: float,
 
 def pick_spread(underlying: str, entry_stamp: str, right: str, close: float,
                 dte_min: int, dte_max: int, last_day: str,
-                timeframe: str = "1Day"):
+                timeframe: str = "1Day", widths=None):
     """Credit spread: ATM short leg + protective wing (above the short
-    strike for calls, below for puts). Iterates expiries AND wing widths -
+    strike for calls, below for puts). `widths` overrides the module's
+    SPREAD_WIDTHS - the caller passes price-scaled candidates when the
+    underlying is not SPY, because a fixed 5 USD wing is 0.71 % of SPY but
+    4.7 % of TLT and therefore a different strategy. Iterates expiries AND
+    wing widths -
     a missing wing at one expiry moves on to the next candidate instead of
     aborting. Returns (occ_s, strike_s, closes_s, occ_w, strike_w, closes_w,
     expiry) of the first candidate whose both legs traded on the entry bar
@@ -213,6 +217,7 @@ def pick_spread(underlying: str, entry_stamp: str, right: str, close: float,
     d0 = date.fromisoformat(entry_day)
     base = round(close)
     sign = 1 if right == "call" else -1
+    widths = SPREAD_WIDTHS if widths is None else widths
     for dte in range(dte_min, dte_max + 1):
         expiry = d0 + timedelta(days=dte)
         if expiry.weekday() >= 5:
@@ -223,7 +228,7 @@ def pick_spread(underlying: str, entry_stamp: str, right: str, close: float,
                 occ_s, entry_day, min(expiry.isoformat(), last_day), timeframe)
             if entry_stamp not in closes_s:
                 continue
-            for width in SPREAD_WIDTHS:
+            for width in widths:
                 strike_w = strike + sign * width
                 occ_w = occ_symbol(underlying, expiry, right, strike_w)
                 closes_w = fetch_option_closes(
@@ -238,6 +243,7 @@ def pick_spread(underlying: str, entry_stamp: str, right: str, close: float,
 # --- simulation ----------------------------------------------------------
 
 def run(bars: list[dict], params: dict, dte_min: int, dte_max: int,
+        spread_width_pct: float = 0.0,
         underlying: str = "SPY", sma: dict[str, float] | None = None,
         style: str = "long_options", regime: str = "mode1",
         cost_usd: float = 0.0, timeframe: str = "1Day",
@@ -367,8 +373,18 @@ def run(bars: list[dict], params: dict, dte_min: int, dte_max: int,
             stats["premium_gross"] += entry_close * mult * qty
         else:                                    # credit-spread leg
             right = "put" if core.is_long else "call"
+            widths = None
+            if spread_width_pct:
+                # Candidates around the requested percentage of spot, in
+                # whole dollars because strikes are; nearest first.
+                want = close * spread_width_pct / 100.0
+                cands = sorted({max(1, int(round(want * f)))
+                                for f in (1.0, 0.75, 1.25, 0.5, 1.5, 2.0)},
+                               key=lambda w: abs(w - want))
+                widths = tuple(cands)
             picked = pick_spread(underlying, stamp, right, close,
-                                 dte_min, dte_max, last_day, timeframe)
+                                 dte_min, dte_max, last_day, timeframe,
+                                 widths=widths)
             if picked is None:
                 raise RuntimeError(
                     f"no tradable {right} credit spread on {stamp}")
