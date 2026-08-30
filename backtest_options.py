@@ -190,6 +190,77 @@ def fetch_option_closes(occ: str, start: str, end: str,
     return closes
 
 
+CHAIN_DIR = "data/chains"
+
+
+def fetch_chain(underlying: str, right: str, exp_from: str,
+                exp_to: str) -> dict[str, list[tuple[float, str]]]:
+    """Real contracts per expiry: {"YYYY-MM-DD": [(strike, occ), ...]}.
+
+    Asks Alpaca which contracts EXIST instead of building OCC symbols from
+    a guessed expiry and a guessed strike grid. Measured 2026-08-30 over
+    five sample days and the DTE window 4-10: of the 25 expiry dates the
+    old "entry day + N weekdays" rule produced, 22 exist for SPY (88 %) but
+    only 3 for DIA (12 %), 11 for AAPL (44 %) and 13 for GLD (52 %). At
+    three of the five DIA sample days the whole window contained no expiry
+    at all. The strike grid differs as well - AAPL and NVDA trade in 2.50
+    steps, SPY and DIA in whole dollars - so of the five strikes the old
+    rule probed around the spot, all five exist for SPY and DIA but only
+    one for AAPL and NVDA. Those two guesses together are what made several
+    underlyings look like they had no option data.
+
+    This is also what the live agent does (agent.py select_spread ->
+    cli.option_contracts), so simulator and bot now pick from one universe.
+
+    Both contract states are queried because an expiry in the past is
+    `inactive`. Cached per (underlying, right, range).
+    """
+    global _ENV
+    os.makedirs(CHAIN_DIR, exist_ok=True)
+    path = os.path.join(
+        CHAIN_DIR, f"{underlying}_{right}_{exp_from}_{exp_to}.json")
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as fh:
+            return {k: [tuple(x) for x in v]
+                    for k, v in json.load(fh).items()}
+    if _ENV is None:
+        _ENV = _cli_env()
+    by_exp: dict[str, list[tuple[float, str]]] = {}
+    for status in ("inactive", "active"):
+        args = [CLI_PATH, "option", "contracts",
+                "--underlying-symbols", underlying,
+                "--expiration-date-gte", exp_from,
+                "--expiration-date-lte", exp_to,
+                "--type", right, "--status", status,
+                "--limit", "10000", "-q"]
+        proc = subprocess.run(args, capture_output=True, text=True, env=_ENV)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"option contracts {underlying} {exp_from}..{exp_to} "
+                f"({status}) failed: {proc.stdout.strip()} "
+                f"{proc.stderr.strip()}")
+        body = json.loads(proc.stdout)
+        if isinstance(body, dict) and body.get("error"):
+            raise RuntimeError(
+                f"option contracts {underlying}: {body['error']}")
+        rows = body.get("option_contracts") or []
+        if len(rows) >= 10000:
+            raise RuntimeError(
+                f"option contracts {underlying} {exp_from}..{exp_to} hit the "
+                f"10000 row cap - the list would be truncated and silently "
+                f"hide expiries; narrow the range")
+        for c in rows:
+            by_exp.setdefault(c["expiration_date"], []).append(
+                (float(c["strike_price"]), c["symbol"]))
+    for v in by_exp.values():
+        v.sort()
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(by_exp, fh)
+    os.replace(tmp, path)
+    return by_exp
+
+
 def occ_symbol(underlying: str, expiry: date, right: str, strike: int) -> str:
     return (f"{underlying}{expiry.strftime('%y%m%d')}"
             f"{'C' if right == 'call' else 'P'}{strike * 1000:08d}")
@@ -198,26 +269,26 @@ def occ_symbol(underlying: str, expiry: date, right: str, strike: int) -> str:
 def pick_contract(underlying: str, entry_stamp: str, right: str, close: float,
                   dte_min: int, dte_max: int, last_day: str,
                   timeframe: str = "1Day") -> tuple[str, date, float] | None:
-    """Nearest weekday expiration in the DTE window, strike nearest to the
-    close (probed +-2 around the rounded strike). Returns (occ, expiry,
-    entry_close) of the first candidate that traded on the entry bar.
-    entry_stamp is the bar key ("YYYY-MM-DD" daily, full timestamp hourly);
-    CLI fetch windows always use its DATE part. Fetch windows are capped at
-    last_day: Alpaca rejects historical requests whose end includes the
-    CURRENT day with 403 'OPRA agreement is not signed' (measured 2026-08-28)."""
+    """Nearest REAL expiration in the DTE window, strike nearest to the
+    close - both taken from the exchange's contract list (fetch_chain).
+    Returns (occ, expiry, entry_close) of the first candidate that traded
+    on the entry bar. entry_stamp is the bar key ("YYYY-MM-DD" daily, full
+    timestamp hourly); CLI fetch windows use its DATE part and are capped
+    at last_day, because Alpaca rejects a request whose end includes the
+    CURRENT day with 403 'OPRA agreement is not signed' (measured
+    2026-08-28)."""
     entry_day = entry_stamp[:10]
     d0 = date.fromisoformat(entry_day)
-    base = round(close)
-    for dte in range(dte_min, dte_max + 1):
-        expiry = d0 + timedelta(days=dte)
-        if expiry.weekday() >= 5:
-            continue
-        for strike in (base, base - 1, base + 1, base - 2, base + 2):
-            occ = occ_symbol(underlying, expiry, right, strike)
+    chain = fetch_chain(underlying, right,
+                        (d0 + timedelta(days=dte_min)).isoformat(),
+                        (d0 + timedelta(days=dte_max)).isoformat())
+    for exp in sorted(chain):
+        for strike, occ in sorted(chain[exp],
+                                  key=lambda x: abs(x[0] - close))[:5]:
             closes = fetch_option_closes(
-                occ, entry_day, min(expiry.isoformat(), last_day), timeframe)
+                occ, entry_day, min(exp, last_day), timeframe)
             if entry_stamp in closes:
-                return occ, expiry, closes[entry_stamp]
+                return occ, date.fromisoformat(exp), closes[entry_stamp]
     return None
 
 
@@ -225,39 +296,53 @@ def pick_spread(underlying: str, entry_stamp: str, right: str, close: float,
                 dte_min: int, dte_max: int, last_day: str,
                 timeframe: str = "1Day", widths=None):
     """Credit spread: ATM short leg + protective wing (above the short
-    strike for calls, below for puts). `widths` overrides the module's
-    SPREAD_WIDTHS - the caller passes price-scaled candidates when the
-    underlying is not SPY, because a fixed 5 USD wing is 0.71 % of SPY but
-    4.7 % of TLT and therefore a different strategy. Iterates expiries AND
-    wing widths -
-    a missing wing at one expiry moves on to the next candidate instead of
-    aborting. Returns (occ_s, strike_s, closes_s, occ_w, strike_w, closes_w,
-    expiry) of the first candidate whose both legs traded on the entry bar
-    with a positive net credit, or None."""
+    strike for calls, below for puts), both chosen from the REAL contract
+    list.
+
+    `widths` overrides SPREAD_WIDTHS with price-scaled candidates - a fixed
+    5 USD wing is 0.71 % of SPY but 4.7 % of TLT, i.e. a different trade.
+    The wing is the existing strike NEAREST to the requested distance, so a
+    symbol whose grid is 2.50 or 5 USD wide is served instead of skipped.
+
+    Iterates real expiries and wing candidates; a missing wing at one
+    expiry moves on to the next. Returns (occ_s, strike_s, closes_s, occ_w,
+    strike_w, closes_w, expiry) of the first candidate whose both legs
+    traded on the entry bar with a positive net credit, or None.
+    """
     entry_day = entry_stamp[:10]
     d0 = date.fromisoformat(entry_day)
-    base = round(close)
     sign = 1 if right == "call" else -1
     widths = SPREAD_WIDTHS if widths is None else widths
-    for dte in range(dte_min, dte_max + 1):
-        expiry = d0 + timedelta(days=dte)
-        if expiry.weekday() >= 5:
-            continue
-        for strike in (base, base - 1, base + 1, base - 2, base + 2):
-            occ_s = occ_symbol(underlying, expiry, right, strike)
+    chain = fetch_chain(underlying, right,
+                        (d0 + timedelta(days=dte_min)).isoformat(),
+                        (d0 + timedelta(days=dte_max)).isoformat())
+    for exp in sorted(chain):
+        by_strike = dict(chain[exp])
+        for strike_s, occ_s in sorted(chain[exp],
+                                      key=lambda x: abs(x[0] - close))[:5]:
             closes_s = fetch_option_closes(
-                occ_s, entry_day, min(expiry.isoformat(), last_day), timeframe)
+                occ_s, entry_day, min(exp, last_day), timeframe)
             if entry_stamp not in closes_s:
                 continue
+            wing_side = [k for k in by_strike
+                         if (k > strike_s if sign > 0 else k < strike_s)]
+            if not wing_side:
+                continue
+            seen = set()
             for width in widths:
-                strike_w = strike + sign * width
-                occ_w = occ_symbol(underlying, expiry, right, strike_w)
+                want = strike_s + sign * width
+                strike_w = min(wing_side, key=lambda k: abs(k - want))
+                if strike_w in seen:
+                    continue
+                seen.add(strike_w)
+                occ_w = by_strike[strike_w]
                 closes_w = fetch_option_closes(
-                    occ_w, entry_day, min(expiry.isoformat(), last_day), timeframe)
+                    occ_w, entry_day, min(exp, last_day), timeframe)
                 if (entry_stamp in closes_w
                         and closes_s[entry_stamp] - closes_w[entry_stamp] > 0):
-                    return (occ_s, strike, closes_s,
-                            occ_w, strike_w, closes_w, expiry)
+                    return (occ_s, strike_s, closes_s,
+                            occ_w, strike_w, closes_w,
+                            date.fromisoformat(exp))
     return None
 
 
