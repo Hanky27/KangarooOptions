@@ -121,6 +121,7 @@ class KangarooAgent:
             initial_qty=config["initial_qty"],
             max_invest_count=config["max_invest_count"],
             start_long=True,          # put-only: the direction never changes
+            max_adverse_pct=config["max_adverse_pct"],
         )
         # per-leg spread details, keyed by the SHORT leg's OCC symbol
         self.leg_extras: dict[str, dict] = {}

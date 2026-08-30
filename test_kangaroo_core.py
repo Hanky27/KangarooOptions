@@ -72,6 +72,41 @@ def test_qty_growth_rounding():
     assert got == [1, 1, 1, 1, 1, 2, 2, 2], got
 
 
+def test_max_adverse_pct_stops_digging_but_keeps_the_cluster():
+    core = make_core(max_adverse_pct=5.0)
+    core.add_leg("C1", 1, entry_underlying=100.0, entry_premium=1.0)
+    core.add_leg("C2", 1, entry_underlying=98.0, entry_premium=1.2)
+    # long cluster: adverse = the underlying FALLING away from leg 1 at 100
+    assert core.check_rebuy(94.9, 95.0) > 0, "4.99 % is inside the cap"
+    assert core.check_rebuy(94.0, 94.9) == 0, "5.1 % adverse stops the rebuy"
+    # the positions and the take-profit test are untouched
+    assert core.invest_count == 2
+    assert core.check_close(1000.0, 94.0, 94.9) is True
+
+
+def test_max_adverse_pct_mirrors_for_the_short_side():
+    core = make_core(start_long=False, max_adverse_pct=5.0)
+    core.add_leg("P1", 1, entry_underlying=100.0, entry_premium=1.0)
+    core.add_leg("P2", 1, entry_underlying=102.0, entry_premium=1.2)
+    # short cluster: adverse = the underlying RISING away from leg 1
+    assert core.check_rebuy(104.9, 105.0) > 0
+    assert core.check_rebuy(105.1, 105.2) == 0
+
+
+def test_max_adverse_pct_off_by_default():
+    core = make_core()
+    assert core.max_adverse_pct == 0.0
+    core.add_leg("C1", 1, entry_underlying=100.0, entry_premium=1.0)
+    core.add_leg("C2", 1, entry_underlying=98.0, entry_premium=1.2)
+    assert core.check_rebuy(50.0, 50.1) > 0, "disabled means no cap at all"
+    try:
+        make_core(max_adverse_pct=-1.0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a negative cap must fail loud")
+
+
 def test_max_invest_count_cap():
     core = make_core(max_invest_count=2)
     core.add_leg("A", 1, 100.0, 1.0)

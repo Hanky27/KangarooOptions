@@ -112,17 +112,27 @@ class KangarooCore:
         max_invest_count: int,
         start_long: bool = True,
         contract_multiplier: int = 100,
+        max_adverse_pct: float = 0.0,
     ) -> None:
         if rebuy_1st_pct <= 0 or rebuy_pct <= 0 or tp_pct <= 0:
             raise ValueError("rebuy_1st_pct, rebuy_pct and tp_pct must be > 0")
         if initial_qty < 1 or max_invest_count < 1:
             raise ValueError("initial_qty and max_invest_count must be >= 1")
+        if max_adverse_pct < 0:
+            raise ValueError("max_adverse_pct must be >= 0 (0 disables it)")
         self.rebuy_1st_pct = float(rebuy_1st_pct)
         self.rebuy_pct = float(rebuy_pct)
         self.tp_pct = float(tp_pct)
         self.initial_qty = int(initial_qty)
         self.max_invest_count = int(max_invest_count)
         self.contract_multiplier = int(contract_multiplier)
+        # Stop DIGGING once the underlying has run this far against the
+        # cluster's first leg (percent, 0 disables). The cluster keeps every
+        # position it holds and still waits for its take profit - only the
+        # rebuy stops. Measured motive: one short cluster of 2026-04-07..21
+        # rode SPY 654 -> 712 (+8.9 %) and produced -5,957 USD, 61 % of all
+        # losses on that side, by adding legs the whole way up.
+        self.max_adverse_pct = float(max_adverse_pct)
         self.is_long = bool(start_long)   # True: call cluster, False: put cluster
         self.cluster_id = 1
         self.legs: list[Leg] = []
@@ -167,11 +177,22 @@ class KangarooCore:
         rebuy_1st_pct (while invest_count < 2) or rebuy_pct (afterwards),
         measured from the LAST leg's entry reference price.
         Adverse for a call cluster = underlying fell; for a put cluster =
-        underlying rose."""
+        underlying rose.
+
+        max_adverse_pct (0 = off) caps how far the underlying may have run
+        against the cluster's FIRST leg before rebuying stops. Nothing is
+        closed - the cluster keeps its positions and its take-profit test;
+        it just stops adding to a move that has already gone against it."""
         if not self.legs:
             return self.initial_qty
         if self.invest_count >= self.max_invest_count:
             return 0
+        if self.max_adverse_pct:
+            first = self.legs[0].entry_underlying
+            spot = spot_ask if self.is_long else spot_bid
+            adverse = ((first - spot) if self.is_long else (spot - first))
+            if adverse / first * 100.0 > self.max_adverse_pct:
+                return 0
         ref = self.legs[-1].entry_underlying
         pct = self.rebuy_1st_pct if self.invest_count < 2 else self.rebuy_pct
         if self.is_long:

@@ -81,6 +81,14 @@ parameters:
     description: "Hard cap of legs per cluster."
     group: grid
 
+  max_adverse_pct:
+    type: float
+    default: 0.0
+    range: [0.0, 20.0]
+    step: 0.5
+    description: "Stop REBUYING once the underlying has run this far (%) against the cluster's first leg. 0 disables it. Nothing is closed - the cluster keeps every position and its take-profit target; it only stops adding to a move that already went against it."
+    group: grid
+
   dte_min:
     type: int
     default: 4

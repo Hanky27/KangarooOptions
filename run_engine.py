@@ -77,7 +77,7 @@ DEFAULT_YAML = HERE / "kangaroo_options_python.yaml"
 # DEFAULT_PARAMS keys; the rest are run() arguments.
 CORE_PARAM_TYPES = {"rebuy_1st_pct": float, "rebuy_pct": float,
                     "tp_pct": float, "initial_qty": int,
-                    "max_invest_count": int}
+                    "max_invest_count": int, "max_adverse_pct": float}
 RUN_PARAM_TYPES = {"dte_min": int, "dte_max": int, "cost_usd": float,
                    "style": str, "direction": str, "underlying": str,
                    "bars_file": str}

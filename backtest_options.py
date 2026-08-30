@@ -80,6 +80,7 @@ from kangaroo_core import KangarooCore, settlement_pnl
 from backtest_underlying import RANGE_BLOWOUT_PCT, KNOWN_DEFECT_DAYS
 
 DEFAULT_PARAMS = dict(rebuy_1st_pct=1.2, rebuy_pct=0.10, tp_pct=0.10,
+                      max_adverse_pct=0.0,
                       initial_qty=1, max_invest_count=20, start_long=True)
 
 CLI_PATH = "C:/Users/HMz/Documents/Source/AlpacaTools/cli/alpaca.exe"
