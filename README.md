@@ -38,13 +38,20 @@ Kangaroo is a pure grid - there is no entry signal. This port sells
 2. Whenever the **underlying** drops by `rebuy_1st_pct` (first rebuy) or
    `rebuy_pct` (all further rebuys) from the last leg's entry reference,
    sell another spread with a growing size (`1.1^n`).
-3. Close the whole cluster (buy back every spread) as soon as its
-   aggregated closeable P&L exceeds
-   `invest_count * initial_qty * 100 * (tp_pct% of the underlying price)`.
-4. **Expiry = let legs expire:** a leg reaching expiration is settled by
-   the broker; OTM expiry keeps the full credit. The cluster keeps living
-   with its remaining legs.
-5. **Put-only:** after a cluster ends the grid restarts in the same
+3. Stop rebuying - but close nothing - once the underlying has run
+   `max_adverse_pct` against the cluster's FIRST leg (0 disables it). The
+   cluster keeps every position and still waits for its take profit; it
+   just stops adding to a move that has already gone against it.
+4. Close the whole cluster (buy back every spread) as soon as the WHOLE
+   cluster - open legs plus the realized pot of already-settled ones -
+   exceeds `invest_count * initial_qty * 100 * (tp_pct% of the underlying
+   price)`. Because the threshold is positive, a cluster never takes
+   profit while its total is negative.
+5. **Expiry = let legs expire:** a leg reaching expiration is settled by
+   the broker at the underlying's close of that day, and its realized USD
+   joins the cluster's sunk pot. OTM expiry keeps the full credit. The
+   cluster keeps living with its remaining legs.
+6. **Put-only:** after a cluster ends the grid restarts in the same
    direction - there is no Mode1 toggle.
 
 Trigger math always runs on the underlying quote, never on option premiums.
