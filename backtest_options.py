@@ -73,6 +73,7 @@ import csv
 import json
 import os
 import subprocess
+import time
 from datetime import date, timedelta
 
 from kangaroo_core import KangarooCore, settlement_pnl
@@ -86,6 +87,9 @@ ENV_FILE = "C:/Users/HMz/Documents/Source/McpServer/alpaca-mcp-server/dist/env.t
 # [HOURLY 29.08.2026] One cache dir per bar resolution - a 1Day close keyed by
 # date and a 1Hour close keyed by full timestamp must never share a file.
 CACHE_DIRS = {"1Day": "data/option_bars", "1Hour": "data/option_bars_1h"}
+
+RATE_LIMIT_RETRIES = 8       # a throttle clears; a real error does not
+RATE_LIMIT_BASE_WAIT_S = 5   # waited 5s, 10s, 15s ... between attempts
 
 SPREAD_WIDTHS = (5, 6, 4, 7, 3, 8, 10)   # credit-spread wing probes, $ from short strike
 
@@ -122,11 +126,30 @@ def fetch_option_closes(occ: str, start: str, end: str,
             return json.load(fh)
     if _ENV is None:
         _ENV = _cli_env()
-    proc = subprocess.run(
-        [CLI_PATH, "data", "option", "bars", "--symbols", occ,
-         "--timeframe", timeframe, "--start", start, "--end", end,
-         "--limit", "1000", "-q"],
-        capture_output=True, text=True, env=_ENV)
+    args = [CLI_PATH, "data", "option", "bars", "--symbols", occ,
+            "--timeframe", timeframe, "--start", start, "--end", end,
+            "--limit", "1000", "-q"]
+    # HTTP 429 is a throttle, not an answer: the server is telling us to
+    # slow down, and the contract's bars are still there. Waiting is the
+    # correct response - aborting the run would turn "you are too fast"
+    # into a missing-data error. Anything else still fails loud, and so
+    # does a throttle that will not clear.
+    for attempt in range(RATE_LIMIT_RETRIES):
+        proc = subprocess.run(args, capture_output=True, text=True, env=_ENV)
+        combined = f"{proc.stdout} {proc.stderr}"
+        throttled = ('"status": 429' in combined
+                     or "too many requests" in combined.lower())
+        if not throttled:
+            break
+        wait = RATE_LIMIT_BASE_WAIT_S * (attempt + 1)
+        print(f"rate limited on {occ}, waiting {wait}s "
+              f"(attempt {attempt + 1}/{RATE_LIMIT_RETRIES})", flush=True)
+        time.sleep(wait)
+    else:
+        raise RuntimeError(
+            f"option bars {occ}: still rate limited after "
+            f"{RATE_LIMIT_RETRIES} attempts - reduce the number of "
+            f"concurrent runs")
     if proc.returncode != 0:
         raise RuntimeError(f"option bars {occ} failed: "
                            f"{proc.stdout.strip()} {proc.stderr.strip()}")
