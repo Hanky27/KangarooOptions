@@ -376,12 +376,24 @@ def run(bars: list[dict], params: dict, dte_min: int, dte_max: int,
             widths = None
             if spread_width_pct:
                 # Candidates around the requested percentage of spot, in
-                # whole dollars because strikes are; nearest first.
+                # whole dollars because strikes are, nearest first.
+                #
+                # The list has to be DENSE, not a handful of multiples:
+                # strike grids differ per symbol, and a sparse list simply
+                # misses them. Measured 2026-08-30 on the first bar of the
+                # 14.-27.08 window - AAPL at 306.10 offers only the strikes
+                # 300/305/310, NVDA at 225.68 only 220/225/230, AMZN at
+                # 264.77 only 260/265/270, all on a 5 USD grid. A 0.71 %
+                # wing wants 2.17 USD there, and the old candidates
+                # 2/3/1/4 hit nothing, so those three symbols aborted with
+                # "no tradable credit spread". Every whole dollar from
+                # 0.4x to 3x the wanted distance reaches a 5 USD grid while
+                # still preferring the requested width.
                 want = close * spread_width_pct / 100.0
-                cands = sorted({max(1, int(round(want * f)))
-                                for f in (1.0, 0.75, 1.25, 0.5, 1.5, 2.0)},
-                               key=lambda w: abs(w - want))
-                widths = tuple(cands)
+                lo = max(1, int(round(want * 0.4)))
+                hi = max(lo + 1, int(round(want * 3.0)))
+                widths = tuple(sorted(range(lo, hi + 1),
+                                      key=lambda w: (abs(w - want), w)))
             picked = pick_spread(underlying, stamp, right, close,
                                  dte_min, dte_max, last_day, timeframe,
                                  widths=widths)
