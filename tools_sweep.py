@@ -39,8 +39,17 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 
 import backtest_options as bt
+
+# The house has ONE implementation of the balance-curve shape metric
+# (QuantroTrader CLAUDE.md REGEL 9.-1 [EVEN-EQUITY]); reimplementing a
+# second Pearson here would be exactly the drift that rule exists to stop.
+_SIGNAL_ENGINE = "C:/Users/HMz/Documents/Source/QuantroTrader"
+if _SIGNAL_ENGINE not in sys.path:
+    sys.path.insert(0, _SIGNAL_ENGINE)
+from SignalEngine.optimizer.equity_shape import equity_linearity
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRATCH = ("C:/Users/HMz/AppData/Local/Temp/claude/"
@@ -52,14 +61,31 @@ WINDOWS = {
     "2026": os.path.join(HERE, "data", "spy_1h.json"),
 }
 
-_BARS: dict[str, list] = {}
+# Other underlyings are sliced out of their own hourly store, which
+# run_engine._ensure_hour_bars builds with the exchange-calendar filter.
+WINDOW_RANGE = {"2025": ("2025-01-01", "2025-12-31"),
+                "2026": ("2026-01-01", "2026-08-27")}
+
+_BARS: dict[tuple[str, str], list] = {}
 
 
-def bars(window: str) -> list:
-    if window not in _BARS:
-        with open(WINDOWS[window], "r", encoding="utf-8") as fh:
-            _BARS[window] = json.load(fh)["bars"]
-    return _BARS[window]
+def bars(window: str, symbol: str = "SPY") -> list:
+    key = (window, symbol.upper())
+    if key not in _BARS:
+        if symbol.upper() == "SPY":
+            path = WINDOWS[window]
+            with open(path, "r", encoding="utf-8") as fh:
+                rows = json.load(fh)["bars"]
+        else:
+            path = os.path.join(HERE, "data", f"{symbol.lower()}_1h.json")
+            with open(path, "r", encoding="utf-8") as fh:
+                rows = json.load(fh)["bars"]
+            lo, hi = WINDOW_RANGE[window]
+            rows = [b for b in rows if lo <= b["t"][:10] <= hi]
+        if not rows:
+            raise RuntimeError(f"no hourly bars for {symbol} in {window}")
+        _BARS[key] = rows
+    return _BARS[key]
 
 
 def run_cell(window: str, start_long: bool, **overrides) -> dict:
@@ -69,10 +95,11 @@ def run_cell(window: str, start_long: bool, **overrides) -> dict:
     grid = {k: v for k, v in overrides.items() if k in params}
     run_kw = {k: v for k, v in overrides.items() if k not in params}
     params.update(grid)
-    res = bt.run(bars(window), params,
+    symbol = str(run_kw.pop("underlying", "SPY")).upper()
+    res = bt.run(bars(window, symbol), params,
                  dte_min=run_kw.pop("dte_min", 4),
                  dte_max=run_kw.pop("dte_max", 10),
-                 underlying="SPY", style="short_premium_spreads",
+                 underlying=symbol, style="short_premium_spreads",
                  regime=run_kw.pop("regime", "same"),
                  timeframe="1Hour", **run_kw)
     eq = [r + o for (_, r, o) in res["equity"]]
@@ -80,9 +107,20 @@ def run_cell(window: str, start_long: bool, **overrides) -> dict:
     for v in eq:
         peak = max(peak, v)
         dd = min(dd, v - peak)
+    # Pearson r of the REALIZED balance against time, one point per closed
+    # cluster, anchored at the first cluster's start so the run-up counts as
+    # elapsed time. The window length belongs to every r that is reported:
+    # 2025 = one calendar year, 2026 = 2026-01-01..08-27.
+    clusters = res["clusters"]
+    r_lin = None
+    if clusters:
+        r_lin = equity_linearity([c["end"] for c in clusters],
+                                 [c["result_usd"] for c in clusters],
+                                 start_time=clusters[0]["start"])
     return {
         "net": round(res["realized_total"], 0),
         "dd": round(dd, 0),
+        "r": None if r_lin is None else round(r_lin, 4),
         "worst": round(min((c["result_usd"] for c in res["clusters"]),
                            default=0.0), 0),
         "clusters": len(res["clusters"]),
@@ -105,9 +143,12 @@ def evaluate(**overrides) -> dict:
     nets = {k: v["net"] for k, v in cells.items()}
     asym = (abs(nets["2025_long"] - nets["2025_short"])
             + abs(nets["2026_long"] - nets["2026_short"]))
+    rs = [v["r"] for v in cells.values() if v["r"] is not None]
     return {
         "params": overrides,
         "cells": cells,
+        "r_min": round(min(rs), 4) if rs else None,
+        "r_mean": round(sum(rs) / len(rs), 4) if rs else None,
         "net_total": sum(nets.values()),
         "asymmetry": asym,
         "worst_dd": min(v["dd"] for v in cells.values()),
@@ -119,7 +160,8 @@ def evaluate(**overrides) -> dict:
 
 def show(label: str, r: dict) -> None:
     c = r["cells"]
-    print(f"{label:34s} net {r['net_total']:+8,.0f} | schlechteste DD "
+    print(f"{label:34s} r_min {str(r['r_min']):>7s} r_mean {str(r['r_mean']):>7s} | "
+          f"net {r['net_total']:+8,.0f} | schlechteste DD "
           f"{r['worst_dd']:+8,.0f} | Asymmetrie {r['asymmetry']:8,.0f} | "
           f"Margin {r['max_margin']:6,.0f} | "
           f"25L {c['2025_long']['net']:+7,.0f} 25S {c['2025_short']['net']:+7,.0f} "
