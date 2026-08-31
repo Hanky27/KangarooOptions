@@ -43,6 +43,21 @@ Alpaca AI Trading Agents Hackathon (lablab.ai), 28 August - 4 September
 | Options | credit spreads, multi-leg limit orders |
 | Market data | Alpaca Basic (indicative options feed) |
 
+### Development during the run
+
+The hackathon is judged on the robustness of the agent workflow as well as
+on P&L, so every change made to the agent WHILE it traded the competition
+account is recorded in **[DEVLOG.md](DEVLOG.md)** - the symptom that was
+measured, the cause with its evidence, the fix, and the measurement that
+confirmed it. Two defects were found and fixed live on day one; both were
+invisible to the backtest because they live in the execution path, which
+the simulator does not exercise.
+
+Deployment to the running agent goes through
+`deploy/update_and_restart.ps1`, which waits for the observed change at
+every step and refuses to report success unless the commit in the running
+process's log banner is the one just shipped.
+
 ### Disclosure of pre-event work
 
 The event FAQ permits work done before kick-off and requires it to be
