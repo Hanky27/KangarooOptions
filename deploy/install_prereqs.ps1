@@ -59,7 +59,12 @@ if (-not $pr.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
    throw 'Run this elevated - a machine-wide install needs it.'
 }
 
-function Install-Silent($name, $url, $args, $probe, $want) {
+# NOTE: the parameter is NOT called $args - that is a PowerShell
+# AUTOMATIC variable, and binding it as a parameter makes the caller's
+# array arrive EMPTY. Measured 2026-08-31 on FOREX12GB-1: Start-Process
+# then failed with "ArgumentList ... ist NULL oder leer" after the
+# installer had already been downloaded.
+function Install-Silent($name, $url, $switches, $probe, $want) {
    if (Test-Path $probe) {
       $have = (& $probe --version 2>&1 | Out-String).Trim()
       if ($have -match [regex]::Escape($want)) {
@@ -72,7 +77,7 @@ function Install-Silent($name, $url, $args, $probe, $want) {
    Write-Output "$name : downloading $url"
    Invoke-WebRequest -Uri $url -OutFile $exe
    Write-Output ("$name : " + [math]::Round((Get-Item $exe).Length / 1MB, 1) + ' MB, installing silently')
-   $p = Start-Process -FilePath $exe -ArgumentList $args -Wait -PassThru
+   $p = Start-Process -FilePath $exe -ArgumentList $switches -Wait -PassThru
    Remove-Item $exe -Force -ErrorAction SilentlyContinue
    if ($p.ExitCode -ne 0) { throw "$name installer exited $($p.ExitCode)" }
    if (-not (Test-Path $probe)) { throw "$name : installer reported success but $probe is missing" }
