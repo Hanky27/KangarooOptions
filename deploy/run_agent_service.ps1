@@ -69,8 +69,14 @@ $commit = (& git -C $RepoDir rev-parse --short HEAD 2>$null)
 # zero hits - measured here: a check for 'grid ready' found 0 in a file
 # that contained 25. AutoFlush, because a buffered writer loses the last
 # and most interesting lines when the process is killed.
-$writer = New-Object IO.StreamWriter($log, $true,
-   (New-Object Text.UTF8Encoding($false)))
+# FileShare.ReadWrite explicitly: StreamWriter(path, append, encoding)
+# opens the file in a way that locks OUT readers, so tailing the log while
+# the agent runs failed with "der Prozess kann nicht auf die Datei
+# zugreifen" - measured here, minutes after the encoding fix. A log nobody
+# can read during a four-day run is no better than no log.
+$fs = New-Object IO.FileStream($log, [IO.FileMode]::Append,
+   [IO.FileAccess]::Write, [IO.FileShare]::ReadWrite)
+$writer = New-Object IO.StreamWriter($fs, (New-Object Text.UTF8Encoding($false)))
 $writer.AutoFlush = $true
 try {
    $banner = ("=== agent start " + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') +
