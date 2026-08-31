@@ -446,7 +446,8 @@ class Instrument:
 
     # --- spread selection ------------------------------------------------
 
-    def select_spread(self, spot_mid: float, today: date) -> dict:
+    def select_spread(self, spot_mid: float, today: date,
+                      positions: dict | None = None) -> dict:
         """Nearest expiration inside [dte_min, dte_max]; short strike
         nearest to spot; wing = the NEAREST EXISTING strike to each
         configured width, further out of the money than the short strike
@@ -479,15 +480,36 @@ class Instrument:
         expiry = min(c["expiration_date"] for c in tradable)
         chain = {float(c["strike_price"]): c
                  for c in tradable if c["expiration_date"] == expiry}
-        short_strike = min(chain, key=lambda s: abs(s - spot_mid))
+        # Skip anything that would NET against a position we already
+        # hold instead of opening a new one. Selling a contract we are long
+        # closes that long; the broker says so (422 "position intent
+        # mismatch, inferred: sell_to_close") and it is right. Measured on
+        # GOOGL_long, whose rebuy stepped onto its own leg-1 wing.
+        held = positions or {}
+
+        def qty_of(strike):
+            c = chain.get(strike)
+            p = held.get(c["symbol"]) if c else None
+            return float(p["qty"]) if p else 0.0
+
+        usable = [k for k in chain if qty_of(k) <= 0]     # not held long
+        if not usable:
+            raise AlpacaCliError(
+                f"every strike at {expiry} for {self.underlying} is already "
+                f"held long - selling any of them would close a wing, not "
+                f"open a leg")
+        short_strike = min(usable, key=lambda s: abs(s - spot_mid))
         wing_side = [k for k in chain
                      if (k > short_strike if self.wing_sign > 0
                          else k < short_strike)]
+        # A wing we are SHORT would likewise net instead of hedging.
+        wing_side = [k for k in wing_side if qty_of(k) >= 0]
         if not wing_side:
             raise AlpacaCliError(
-                f"no strike at all "
+                f"no usable strike "
                 f"{'below' if self.wing_sign < 0 else 'above'} "
-                f"{short_strike} at {expiry} for {self.underlying}")
+                f"{short_strike} at {expiry} for {self.underlying} "
+                f"(a strike held short cannot serve as a wing)")
         candidates, seen = [], set()
         for width in self.spread_widths:
             want = short_strike + self.wing_sign * width
@@ -525,8 +547,9 @@ class Instrument:
     # --- trading actions -------------------------------------------------
 
     def open_leg(self, qty: int, spot_bid: float, spot_ask: float,
-                 today: date) -> None:
-        spread = self.select_spread((spot_bid + spot_ask) / 2.0, today)
+                 today: date, positions: dict | None = None) -> None:
+        spread = self.select_spread((spot_bid + spot_ask) / 2.0, today,
+                                    positions)
         coid = self.coid("o", self.core.invest_count)
         legs = [
             {"symbol": spread["occ_short"], "ratio_qty": "1",
@@ -770,7 +793,8 @@ class Instrument:
         qty = self.core.check_rebuy(spot_bid, spot_ask)
         if qty:
             self.open_leg(qty, spot_bid, spot_ask,
-                          date.fromisoformat(clock["timestamp"][:10]))
+                          date.fromisoformat(clock["timestamp"][:10]),
+                          positions)
 
 
 class KangarooAgent:

@@ -404,22 +404,73 @@ class MixedGridCli:
                         + [80.0, 80.5, 81.0, 81.5, 82.0, 82.5, 83.0, 83.5])
         self.asked = None
 
+    @staticmethod
+    def occ(underlying, right, strike):
+        return (f"{underlying}260902{right[0].upper()}"
+                f"{int(strike * 1000):08d}")
+
     def option_contracts(self, underlying, gte, lte, right):
         self.asked = right
-        return [{"symbol": f"TLT260902{right[0].upper()}{int(k * 1000):08d}",
+        self.underlying = underlying
+        return [{"symbol": self.occ(underlying, right, k),
                  "strike_price": k, "expiration_date": "2026-09-02",
                  "tradable": True} for k in self.strikes]
 
     def option_quotes(self, occs):
-        # Short leg rich, every wing cheap -> a positive credit either way,
-        # so the test isolates the STRIKE choice and nothing else.
+        # Priced BY STRIKE, so a put credit spread (sell the higher strike,
+        # buy the lower) always carries a positive credit. A flat price
+        # would make every candidate fail the credit check and the test
+        # would then be measuring the wrong thing.
         out = {}
         for occ in occs:
-            rich = occ.endswith("00082500")
-            out[occ] = {"bp": 2.00 if rich else 0.20,
-                        "ap": 2.10 if rich else 0.30,
+            strike = int(occ[-8:]) / 1000.0
+            bp = strike * 0.10
+            out[occ] = {"bp": round(bp, 2), "ap": round(bp + 0.02, 2),
                         "t": "2026-08-31T13:44"}
         return out
+
+
+def test_a_strike_held_long_is_not_sold_as_the_short_leg():
+    """The rebuy steps one wing-width further out, which lands exactly on
+    the previous leg's wing. Selling a contract the account is long does
+    not open a short leg - it closes the wing, and the broker says so:
+    422 "position intent mismatch, inferred: sell_to_close". Measured on
+    GOOGL_long, leg 1 = 345/340, rebuy = 340/335."""
+    cli = MixedGridCli()
+    cli.strikes = [float(k) for k in range(330, 351)]
+    cfg = {"underlying": "GOOGL", "rebuy_1st_pct": 1.2, "rebuy_pct": 0.10,
+           "tp_pct": 0.10, "initial_qty": 1, "max_invest_count": 20,
+           "max_adverse_pct": 0.0, "dte_min": 1, "dte_max": 4,
+           "spread_widths": [5], "poll_fill_seconds": 2,
+           "fill_requote_samples": 30, "start_long": True}
+    inst = Instrument(cfg, cli, True, tempfile.mkdtemp(prefix="kang_net_"))
+    # Leg 1 already on the books: short 345, long 340 as the wing.
+    def occ(k):
+        return MixedGridCli.occ("GOOGL", "put", k)
+    positions = {occ(345.0): {"symbol": occ(345.0), "qty": "-1"},
+                 occ(340.0): {"symbol": occ(340.0), "qty": "1"}}
+    spread = inst.select_spread(340.0, date(2026, 8, 31), positions)
+    assert spread["strike"] != 340.0, (
+        "340 is held LONG - selling it closes the wing", spread)
+    assert spread["wing_strike"] != 345.0, (
+        "345 is held SHORT - buying it closes that leg", spread)
+    assert spread["wing_strike"] < spread["strike"], spread
+
+
+def test_without_positions_the_nearest_strike_is_still_taken():
+    """No account snapshot -> nothing to net against -> unchanged
+    behaviour. The netting guard must not move strikes on its own."""
+    cli = MixedGridCli()
+    cli.strikes = [float(k) for k in range(330, 351)]
+    cfg = {"underlying": "GOOGL", "rebuy_1st_pct": 1.2, "rebuy_pct": 0.10,
+           "tp_pct": 0.10, "initial_qty": 1, "max_invest_count": 20,
+           "max_adverse_pct": 0.0, "dte_min": 1, "dte_max": 4,
+           "spread_widths": [5], "poll_fill_seconds": 2,
+           "fill_requote_samples": 30, "start_long": True}
+    inst = Instrument(cfg, cli, True, tempfile.mkdtemp(prefix="kang_net2_"))
+    spread = inst.select_spread(340.0, date(2026, 8, 31))
+    assert spread["strike"] == 340.0, spread
+    assert spread["wing_strike"] == 335.0, spread
 
 
 def test_wing_snaps_to_the_nearest_existing_strike():
@@ -454,7 +505,9 @@ def test_a_side_with_no_strike_at_all_still_fails_loud():
     try:
         inst.select_spread(82.4, date(2026, 8, 31))
     except agent_mod.AlpacaCliError as exc:
-        assert "no strike at all" in str(exc), exc
+        # The wording covers both reasons a side can be unusable:
+        # nothing there at all, or everything there held short.
+        assert "no usable strike" in str(exc), exc
     else:
         raise AssertionError("an empty wing side must fail loud")
 
