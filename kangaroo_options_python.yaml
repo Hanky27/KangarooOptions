@@ -19,10 +19,15 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-# Kangaroo Options - put-credit-spread grid (QuantroTrader GUI wiring).
+# Kangaroo Options - credit-spread grid (QuantroTrader GUI wiring).
 # Entry point: run_engine.py -> backtest_options.run (the same simulator the
-# research CLI uses). Defaults = the winning configuration of the 11-run
-# backtest sweep of 2026-08-28 (put-only put credit spreads on SPY).
+# research CLI uses).
+#
+# The bot trades N instruments, one per file in the folder named by the
+# `config_path` parameter - the same loader shape the live agent uses, and
+# resolved by the agent's own loader so a GUI run and the bot can never
+# describe different sets. An instrument is a (symbol, direction) pair, so
+# one symbol may carry both a put-spread and a call-spread grid.
 bot: kangaroo_options
 
 # --- Engine wiring (read by the QuantroTrader GUI toolbar) ---------------
@@ -35,7 +40,14 @@ engine: python
 # from 1Hour option bars). Any other TF fails loud.
 data_source: Alpaca/SPY/h1
 broker: Alpaca
-symbol: SPY
+# The bot resolves its own universe from config_path, so there is no single
+# instrument to name here. `portfolio: true` tells the GUI exactly that: it
+# passes no --symbol, measures date coverage over the whole universe, and
+# seeds its Symbol dropdown from the symbols a run actually traded. A
+# concrete `symbol:` would pin the whole bot to ONE instrument
+# (RobotPluginViewModel.IsSingleSymbolBot).
+portfolio: true
+symbol: _
 timeframe: h1
 starting_capital: 100000
 
@@ -116,7 +128,7 @@ parameters:
     type: enum
     default: long
     values: [long, short, mode1, sma200, sma200_flat]
-    description: "Market side, like the original Direction: long (put-spread grid), short (call-spread grid), mode1 (original toggle), sma200 (side from the 200-day SMA), sma200_flat (long above SMA, else flat). Measured SPY 02/2024-08/2026 (daily, after the 2026-08-29 wing-mark fix): long +2,688 / short -5,298 / mode1 +693 USD."
+    description: "Market side of the SINGLE-instrument fallback (config_path empty or _): long (put-spread grid), short (call-spread grid), mode1 (original toggle), sma200 (side from the 200-day SMA), sma200_flat (long above SMA, else flat). Ignored when config_path names a folder - each instrument config carries its own start_long. Measured SPY 02/2024-08/2026 (daily, after the 2026-08-29 wing-mark fix): long +2,688 / short -5,298 / mode1 +693 USD."
     group: strategy
 
   cost_usd:
@@ -127,10 +139,16 @@ parameters:
     description: "Execution cost in USD per spread per execution (entry and TP close; expiry costs nothing)."
     group: costs
 
+  config_path:
+    type: string
+    default: configs
+    description: "Folder of per-instrument configs, relative to the bot folder - one *.yaml per (symbol, direction), each inheriting these panel values and overriding what it names. Resolved by the LIVE AGENT's loader (agent.load_instrument_configs), so the backtest and the bot always trade the same set. Empty or _ falls back to the single instrument the `underlying` and `direction` parameters describe. With a folder, those two are ignored - every instrument declares its own."
+    group: meta
+
   underlying:
     type: string
     default: SPY
-    description: "Underlying symbol; its daily bars must exist as data/<underlying lowercase>_daily.json (see bars_file)."
+    description: "Underlying symbol of the SINGLE-instrument fallback (config_path empty or _). Ignored when config_path names a folder. Its daily bars must exist as data/<underlying lowercase>_daily.json (see bars_file)."
     group: meta
 
   bars_file:

@@ -10,6 +10,11 @@
 
 underlying: SPY
 start_long: false        # call credit spreads
-tp_pct: 0.02
 dte_min: 1
 dte_max: 4
+rebuy_1st_pct: 1.2
+rebuy_pct: 0.1
+tp_pct: 0.02
+initial_qty: 1
+max_invest_count: 20
+max_adverse_pct: 5.0

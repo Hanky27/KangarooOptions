@@ -59,6 +59,8 @@ import json
 import os
 import sys
 
+from tools_week import CORE_KEYS
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.path.join(HERE, "configs")
 
@@ -108,11 +110,27 @@ def write_config(row: dict, window: str) -> str:
         f"start_long: {'true' if row['side'] == 'long' else 'false'}"
         f"        # {'put' if row['side'] == 'long' else 'call'}"
         f" credit spreads",
-        f"tp_pct: {row['tp']}",
         f"dte_min: {dte_min}",
         f"dte_max: {dte_max}",
-        "",
     ]
+    # EVERY grid parameter the measurement used, not just the ones the
+    # search varied. A config that leaves one to the loader can be re-run
+    # against a different default and silently describe another strategy -
+    # measured 2026-08-31, when max_adverse_pct was 5.0 in the search and
+    # 0.0 in the portfolio tool.
+    if "params" not in row:
+        raise SystemExit(
+            f"{row['symbol']} {row['side']}: this search result predates the "
+            f"self-contained configs and does not record the parameters it "
+            f"ran with. Re-run tools_week.py for this symbol.")
+    for key in CORE_KEYS:
+        if key not in row["params"]:
+            raise SystemExit(
+                f"{row['symbol']} {row['side']}: the search result has no "
+                f"'{key}' - regenerate data/week_*.json with the current "
+                f"tools_week.py before writing configs")
+        lines.append(f"{key}: {row['params'][key]}")
+    lines.append("")
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines))
     return path

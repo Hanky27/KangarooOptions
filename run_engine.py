@@ -80,7 +80,7 @@ CORE_PARAM_TYPES = {"rebuy_1st_pct": float, "rebuy_pct": float,
                     "max_invest_count": int, "max_adverse_pct": float}
 RUN_PARAM_TYPES = {"dte_min": int, "dte_max": int, "cost_usd": float,
                    "style": str, "direction": str, "underlying": str,
-                   "bars_file": str}
+                   "bars_file": str, "config_path": str}
 
 # Panel `direction` -> (simulator regime, start_long): the ONE market-side
 # knob, mirroring the original Kangaroo's Direction parameter. Measured on
@@ -93,6 +93,85 @@ DIRECTION_MAP = {
     "sma200":      ("sma200",      True),   # side from close vs 200-day SMA
     "sma200_flat": ("sma200_flat", True),   # long side above SMA, else flat
 }
+
+
+class Leg:
+    """One simulated instrument: a symbol, a direction, its own grid."""
+
+    def __init__(self, name, underlying, core_params, dte_min, dte_max,
+                 regime):
+        self.name = name
+        self.underlying = underlying
+        self.core_params = core_params
+        self.dte_min, self.dte_max = dte_min, dte_max
+        self.regime = regime
+        self.result = None
+
+
+def _instruments(run_params: dict, core_params: dict, regime: str,
+                 start_long: bool) -> list:
+    """The universe this run simulates.
+
+    `config_path` empty or "_" -> the single instrument the panel
+    parameters describe (unchanged behaviour). A folder -> one instrument
+    per *.yaml in it, resolved by the LIVE AGENT's own loader so the
+    backtest and the bot can never trade different sets.
+
+    A per-instrument config carries `underlying` and `start_long` and may
+    override any grid parameter; everything it does not name comes from the
+    GUI panel. The panel's own `direction` and `underlying` are therefore
+    ignored in this mode - each instrument declares its own, and the log
+    line below names what actually ran.
+    """
+    raw = str(run_params.get("config_path", "") or "").strip()
+    if raw in ("", "_"):
+        return [Leg(f"{run_params['underlying']}_"
+                    f"{'long' if start_long else 'short'}",
+                    run_params["underlying"], dict(core_params),
+                    run_params["dte_min"], run_params["dte_max"], regime)]
+    from agent import load_instrument_configs
+    loader = {"config_path": raw}
+    legs = []
+    for cfg in load_instrument_configs(loader, str(HERE)):
+        params = dict(core_params)
+        for key, caster in CORE_PARAM_TYPES.items():
+            if key in cfg:
+                params[key] = caster(cfg[key])
+        params["start_long"] = bool(cfg.get("start_long", True))
+        legs.append(Leg(
+            f"{cfg['underlying']}_"
+            f"{'long' if params['start_long'] else 'short'}",
+            str(cfg["underlying"]).upper(), params,
+            int(cfg.get("dte_min", run_params["dte_min"])),
+            int(cfg.get("dte_max", run_params["dte_max"])),
+            "same"))
+    if not legs:
+        raise RuntimeError(f"config_path '{raw}' resolved to no instruments")
+    return legs
+
+
+def _merge_equity(legs: list) -> tuple[list, list]:
+    """([(stamp, realized_sum, open_sum)], stamps).
+
+    A stamp an instrument has no bar for carries that instrument's LAST
+    values forward - dropping it would silently remove an open position
+    from the portfolio total on every bar its symbol did not print.
+    """
+    stamps = sorted({t for leg in legs for (t, _, _) in leg.result["equity"]})
+    cols = {}
+    for leg in legs:
+        by = {t: (r, o) for (t, r, o) in leg.result["equity"]}
+        last, col = (0.0, 0.0), []
+        for t in stamps:
+            last = by.get(t, last)
+            col.append(last)
+        cols[leg.name] = col
+    merged = []
+    for i, t in enumerate(stamps):
+        merged.append((t,
+                       sum(cols[n][i][0] for n in cols),
+                       sum(cols[n][i][1] for n in cols)))
+    return merged, stamps
 
 
 def _parse_ddmmyyyy(s: str) -> dt.date:
@@ -294,72 +373,98 @@ def main(argv=None) -> int:
               "run them on TF Day.", file=sys.stderr)
         return 1
 
-    if timeframe == "1Hour":
-        try:
-            bars_path = _ensure_hour_bars(run_params["underlying"], start, end)
-        except RuntimeError as exc:
-            print(f"ERROR: {exc}", file=sys.stderr)
-            return 1
-    else:
-        bars_path = (HERE / run_params["bars_file"]).resolve()
-    if not bars_path.is_file():
-        print(f"ERROR: bars file not found: {bars_path}", file=sys.stderr)
-        return 1
-    all_bars = json.loads(bars_path.read_text(encoding="utf-8"))["bars"]
-    first_day = all_bars[0]["t"][:10]
-    last_day = all_bars[-1]["t"][:10]
-    if not _covers(first_day, last_day, start, end):
-        print(f"ERROR: requested window {start}..{end} exceeds the bar store "
-              f"{first_day}..{last_day} ({bars_path})", file=sys.stderr)
-        return 1
-    bars = [b for b in all_bars
-            if start.isoformat() <= b["t"][:10] <= end.isoformat()]
-
-    sma = None
-    if regime in ("sma200", "sma200_flat"):
-        closes = [b["c"] for b in all_bars]
-        sma = {b["t"][:10]: sum(closes[i - 199:i + 1]) / 200.0
-               for i, b in enumerate(all_bars) if i >= 199}
-
+    legs = _instruments(run_params, core_params, regime, start_long)
     balance0 = float(args.balance)
-    print(f"[run_engine] {BOT_NAME} {run_params['style']}/{direction} "
-          f"on {run_params['underlying']} {start}..{end} | "
-          f"balance={balance0:,.0f} | {timeframe} bars={len(bars)}", flush=True)
+    print(f"[run_engine] {BOT_NAME} {run_params['style']} {start}..{end} | "
+          f"balance={balance0:,.0f} | {timeframe} | {len(legs)} instrument(s):"
+          f" {', '.join(l.name for l in legs)}", flush=True)
 
-    trade_no = {"n": 0}
+    # Simulate every instrument first, WITHOUT the observers. The GUI reads
+    # one monotonically advancing stream; sequential per-instrument streams
+    # would jump back to the window start N times.
+    for n, leg in enumerate(legs, start=1):
+        if timeframe == "1Hour":
+            try:
+                bars_path = _ensure_hour_bars(leg.underlying, start, end)
+            except RuntimeError as exc:
+                print(f"ERROR: {leg.name}: {exc}", file=sys.stderr)
+                return 1
+        else:
+            bars_path = (HERE / run_params["bars_file"]).resolve()
+        if not bars_path.is_file():
+            print(f"ERROR: bars file not found: {bars_path}", file=sys.stderr)
+            return 1
+        all_bars = json.loads(bars_path.read_text(encoding="utf-8"))["bars"]
+        first_day, last_day = all_bars[0]["t"][:10], all_bars[-1]["t"][:10]
+        if not _covers(first_day, last_day, start, end):
+            print(f"ERROR: {leg.name}: requested window {start}..{end} "
+                  f"exceeds the bar store {first_day}..{last_day} "
+                  f"({bars_path})", file=sys.stderr)
+            return 1
+        bars = [b for b in all_bars
+                if start.isoformat() <= b["t"][:10] <= end.isoformat()]
+        sma = None
+        if leg.regime in ("sma200", "sma200_flat"):
+            closes = [b["c"] for b in all_bars]
+            sma = {b["t"][:10]: sum(closes[i - 199:i + 1]) / 200.0
+                   for i, b in enumerate(all_bars) if i >= 199}
+        print(f"[run_engine] ({n}/{len(legs)}) {leg.name}: {len(bars)} bars, "
+              f"dte {leg.dte_min}-{leg.dte_max}, "
+              f"tp {leg.core_params['tp_pct']}", flush=True)
+        try:
+            leg.result = run_options_backtest(
+                bars, leg.core_params, leg.dte_min, leg.dte_max,
+                underlying=leg.underlying, sma=sma,
+                style=run_params["style"], regime=leg.regime,
+                cost_usd=run_params["cost_usd"], timeframe=timeframe)
+        except Exception as exc:
+            print(f"ERROR: {leg.name}: backtest failed: {exc}",
+                  file=sys.stderr, flush=True)
+            traceback.print_exc(file=sys.stderr)
+            return 1
 
-    def on_day(i, total, stamp, realized, open_mark):
+    # --- merge -----------------------------------------------------------
+    merged_equity, stamps = _merge_equity(legs)
+    all_clusters = []
+    for leg in legs:
+        for c in leg.result["clusters"]:
+            all_clusters.append(dict(c, symbol=leg.underlying,
+                                     instrument=leg.name))
+    all_clusters.sort(key=lambda c: (c["end"], c["symbol"]))
+
+    # --- the GUI stream, in time order -----------------------------------
+    trade_no, next_trade = {"n": 0}, 0
+    total_bars = len(stamps)
+    for i, (stamp, realized, open_mark) in enumerate(merged_equity):
+        while (next_trade < len(all_clusters)
+               and all_clusters[next_trade]["end"] <= stamp):
+            c = all_clusters[next_trade]
+            next_trade += 1
+            trade_no["n"] += 1
+            end_d, end_t, _ = _stamp_parts(c["end"])
+            open_d, open_t, _ = _stamp_parts(c["start"])
+            side = "buy" if c["direction"] == "long" else "sell"
+            print(f"{end_d} {end_t}.000 | TRADE | "
+                  f"id={trade_no['n']} sym={c['symbol']} dir={side} "
+                  f"vol={c['legs_at_end']} in={c['start_price']:.2f} "
+                  f"out={c['end_price']:.2f} "
+                  f"net={c['result_usd']:.2f} gross={c['result_usd']:.2f} "
+                  f"comm=0.00 ret=0.0000 open={open_d} {open_t}.000",
+                  flush=True)
         bal = balance0 + realized
         eq = bal + open_mark
         date_s, time_s, iso = _stamp_parts(stamp)
-        pct = (i + 1) / total * 100.0 if total else 100.0
+        pct = (i + 1) / total_bars * 100.0 if total_bars else 100.0
         print(f"{date_s} {time_s}.000 | {pct:.1f} % | "
               f"Bal={bal:.2f} Eq={eq:.2f} MinEq={eq:.2f} MaxEq={eq:.2f} "
               f"Time={iso} | 0 pos, {trade_no['n']} trades", flush=True)
 
-    def on_cluster(c):
-        trade_no["n"] += 1
-        end_d, end_t, _ = _stamp_parts(c["end"])
-        open_d, open_t, _ = _stamp_parts(c["start"])
-        side = "buy" if c["direction"] == "long" else "sell"
-        print(f"{end_d} {end_t}.000 | TRADE | "
-              f"id={trade_no['n']} sym={run_params['underlying']} dir={side} "
-              f"vol={c['legs_at_end']} in={c['start_price']:.2f} "
-              f"out={c['end_price']:.2f} "
-              f"net={c['result_usd']:.2f} gross={c['result_usd']:.2f} "
-              f"comm=0.00 ret=0.0000 open={open_d} {open_t}.000", flush=True)
-
-    try:
-        result = run_options_backtest(
-            bars, core_params, run_params["dte_min"], run_params["dte_max"],
-            underlying=run_params["underlying"], sma=sma,
-            style=run_params["style"], regime=regime,
-            cost_usd=run_params["cost_usd"], timeframe=timeframe,
-            on_day=on_day, on_cluster=on_cluster)
-    except Exception as exc:
-        print(f"ERROR: backtest failed: {exc}", file=sys.stderr, flush=True)
-        traceback.print_exc(file=sys.stderr)
-        return 1
+    result = {
+        "clusters": all_clusters,
+        "equity": merged_equity,
+        "realized_total": sum(l.result["realized_total"] for l in legs),
+        "open_book": None,
+    }
 
     # canonical report -----------------------------------------------------
     points, eq_series, bal_series = [], [], []
@@ -385,7 +490,10 @@ def main(argv=None) -> int:
             "id": i,
             "entryTime": _ms_epoch(c["start"]),
             "closeTime": _ms_epoch(c["end"]),
-            "symbol": run_params["underlying"],
+            # The trade's OWN symbol. The GUI seeds its Symbol dropdown
+            # from the symbols a run actually traded, so a bot-wide symbol
+            # here would make 25 instruments look like one.
+            "symbol": c["symbol"],
             # MARKET side, not the option action. The chart draws this on the
             # UNDERLYING axis (up/green for buy, down/red for sell), and a put
             # credit spread is a bullish position even though its legs are
@@ -400,21 +508,28 @@ def main(argv=None) -> int:
             "entryPrice": c["start_price"], "closePrice": c["end_price"],
             "net": c["result_usd"], "gross": c["result_usd"],
             "commissions": 0.0, "tradeReturn": 0.0,
-            "comment": f"cluster {c['cluster_id']} {c['direction']} "
+            "comment": f"{c['instrument']} cluster {c['cluster_id']} "
                        f"end={c['end_kind']} legs={c['legs_at_end']}",
         })
 
+    # One row per instrument still holding a cluster when the window ends.
+    # A single row would hide that several grids are open at once, which is
+    # exactly the state that decides whether the run really earned its
+    # realized line.
     open_items = []
-    ob = result["open_book"]
-    if ob:
+    for leg in legs:
+        ob = leg.result["open_book"]
+        if not ob:
+            continue
         open_items.append({
-            "symbol": run_params["underlying"],
+            "symbol": leg.underlying,
             "direction": "buy" if ob["direction"] == "long" else "sell",
             "volume": float(ob["legs"]), "entryPrice": ob["start_price"],
             "currentPrice": ob["last_price"], "net": float(ob["mark_usd"]),
             "commissions": 0.0, "swap": 0.0,
-            "entryTime": _ms_epoch(ob["start"] or result["equity"][-1][0]),
-            "label": f"open cluster, {ob['legs']} legs",
+            "entryTime": _ms_epoch(ob["start"]
+                                   or leg.result["equity"][-1][0]),
+            "label": f"{leg.name}: open cluster, {ob['legs']} legs",
         })
 
     wins = [t["net"] for t in items if t["net"] > 0]
@@ -426,7 +541,9 @@ def main(argv=None) -> int:
     report = {
         "main": {
             "engine": "python", "bot": BOT_NAME,
-            "symbol": run_params["underlying"],
+            # "All" once more than one instrument ran: naming one of them
+            # would claim the whole result belongs to that symbol.
+            "symbol": (legs[0].underlying if len(legs) == 1 else "All"),
             "period": "h1" if timeframe == "1Hour" else "d1",
             "startDate": start.isoformat(), "endDate": end.isoformat(),
             "initialBalance": balance0,

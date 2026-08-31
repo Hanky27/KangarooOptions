@@ -64,6 +64,12 @@ WINDOW_LAST = ("2026-08-24", "2026-08-28")
 
 TRADING_DAYS_PER_WEEK = 5.0
 
+# Every grid parameter a run depends on. A generated config names all of
+# them, so a config file is a complete description of the measurement
+# behind it and cannot be re-run against a different default.
+CORE_KEYS = ("rebuy_1st_pct", "rebuy_pct", "tp_pct", "initial_qty",
+             "max_invest_count", "max_adverse_pct")
+
 
 def bars(symbol: str, window: tuple[str, str]) -> list[dict]:
     """RTH hourly bars of one symbol inside a date window."""
@@ -97,9 +103,11 @@ def run_cell(symbol: str, start_long: bool, window: tuple[str, str],
     run_kw = {k: v for k, v in overrides.items() if k not in params}
     params.update(grid)
     rows = bars(symbol, window)
+    run_kw_dte_min = run_kw.pop("dte_min", 4)
+    run_kw_dte_max = run_kw.pop("dte_max", 10)
     res = bt.run(rows, params,
-                 dte_min=run_kw.pop("dte_min", 4),
-                 dte_max=run_kw.pop("dte_max", 10),
+                 dte_min=run_kw_dte_min,
+                 dte_max=run_kw_dte_max,
                  underlying=symbol, style="short_premium_spreads",
                  regime=run_kw.pop("regime", "same"),
                  timeframe="1Hour", **run_kw)
@@ -118,6 +126,10 @@ def run_cell(symbol: str, start_long: bool, window: tuple[str, str],
     return {
         "symbol": symbol,
         "side": "long" if start_long else "short",
+        # The grid parameters this cell actually ran with. They travel into
+        # the generated config so no later loader can reinterpret them.
+        "params": {k: params[k] for k in CORE_KEYS},
+        "dte_min": run_kw_dte_min, "dte_max": run_kw_dte_max,
         "trades": len(clusters),
         "wins": len(wins),
         "win_rate": round(len(wins) / len(clusters), 3) if clusters else None,

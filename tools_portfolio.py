@@ -56,7 +56,7 @@ import sys
 import yaml
 
 import backtest_options as bt
-from tools_week import WINDOW, bars
+from tools_week import CORE_KEYS, WINDOW, bars
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.path.join(HERE, "configs")
@@ -66,10 +66,18 @@ ACCOUNT_USD = 100_000.0
 def run_one(cfg: dict, window: tuple[str, str]) -> dict:
     params = dict(bt.DEFAULT_PARAMS)
     params["start_long"] = bool(cfg.get("start_long", True))
-    for key in ("rebuy_1st_pct", "rebuy_pct", "tp_pct", "initial_qty",
-                "max_invest_count", "max_adverse_pct"):
-        if key in cfg:
-            params[key] = cfg[key]
+    # No fallback: a config that does not name a grid parameter would be
+    # measured here against bt.DEFAULT_PARAMS while the search that picked
+    # it used another value. That happened - max_adverse_pct was 5.0 in
+    # tools_week.py and 0.0 here - and nothing caught it, because a
+    # silently different strategy still produces plausible numbers.
+    for key in CORE_KEYS:
+        if key not in cfg:
+            raise SystemExit(
+                f"{cfg.get('underlying')}: config names no '{key}'. Rewrite "
+                f"the configs with tools_make_configs.py - a config must "
+                f"state every parameter its measurement used.")
+        params[key] = cfg[key]
     sym = cfg["underlying"].upper()
     return bt.run(bars(sym, window), params,
                   dte_min=int(cfg["dte_min"]), dte_max=int(cfg["dte_max"]),
