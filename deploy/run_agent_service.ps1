@@ -59,23 +59,43 @@ $log = Join-Path $logDir ('agent_' + (Get-Date -Format 'yyyy-MM-dd') + '.log')
 
 Set-Location $RepoDir
 $commit = (& git -C $RepoDir rev-parse --short HEAD 2>$null)
-# $PID is THIS wrapper, not python - python has not been started yet when
-# the banner is written. Labelled as such so a log line can never be
-# mistaken for the agent's own pid; the agent logs its own pid itself when
-# it takes the instance lock.
-$banner = ("=== agent start " + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') +
-   " | commit " + $commit + " | wrapper pid " + $PID +
-   " | user " + $env:USERNAME + " ===")
-Add-Content -Path $log -Value $banner -Encoding UTF8
-Write-Host $banner
+# NOTE on the pid below: $PID is THIS wrapper, not python - python has not
+# been started when the banner is written. Labelled as such so a log line
+# can never be mistaken for the agent's own pid; the agent logs its own pid
+# itself, on the line where it takes the instance lock.
+# ONE writer for the whole file. Tee-Object defaults to UTF-16 in Windows
+# PowerShell 5.1 while Add-Content -Encoding UTF8 writes UTF-8, and mixing
+# them produces a log that grep calls "binary" and Select-String scans to
+# zero hits - measured here: a check for 'grid ready' found 0 in a file
+# that contained 25. AutoFlush, because a buffered writer loses the last
+# and most interesting lines when the process is killed.
+$writer = New-Object IO.StreamWriter($log, $true,
+   (New-Object Text.UTF8Encoding($false)))
+$writer.AutoFlush = $true
+try {
+   $banner = ("=== agent start " + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') +
+      " | commit " + $commit + " | wrapper pid " + $PID +
+      " | user " + $env:USERNAME + " ===")
+   $writer.WriteLine($banner)
+   Write-Host $banner
 
-# -u so python does not buffer: a buffered agent writes nothing to the log
-# until it exits, which for a process meant to run for days means nothing
-# at all. 2>&1 folds stderr in so a traceback lands in the same file.
-& $Python -u agent.py 2>&1 | Tee-Object -FilePath $log -Append
+   # -u so python does not buffer: a buffered agent writes nothing to the
+   # log until it exits, which for a process meant to run for days means
+   # nothing at all. 2>&1 folds stderr in so a traceback lands in the same
+   # file.
+   & $Python -u agent.py 2>&1 | ForEach-Object {
+      $line = [string]$_
+      Write-Host $line
+      $writer.WriteLine($line)
+   }
+   $code = $LASTEXITCODE
 
-$tail = ("=== agent exit " + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') +
-   " | exitcode " + $LASTEXITCODE + " ===")
-Add-Content -Path $log -Value $tail -Encoding UTF8
-Write-Host $tail
-exit $LASTEXITCODE
+   $tail = ("=== agent exit " + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') +
+      " | exitcode " + $code + " ===")
+   $writer.WriteLine($tail)
+   Write-Host $tail
+}
+finally {
+   $writer.Close()
+}
+exit $code
