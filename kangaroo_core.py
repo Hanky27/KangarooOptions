@@ -133,7 +133,13 @@ class KangarooCore:
         # rode SPY 654 -> 712 (+8.9 %) and produced -5,957 USD, 61 % of all
         # losses on that side, by adding legs the whole way up.
         self.max_adverse_pct = float(max_adverse_pct)
-        self.is_long = bool(start_long)   # True: call cluster, False: put cluster
+        # True = BULLISH cluster, False = bearish. Which contract that is
+        # depends on the style: in the credit-spread style bullish is a PUT
+        # spread and bearish a CALL spread (backtest_options.py `right =
+        # "put" if core.is_long else "call"`); in the long_options style it
+        # is the other way round. What is fixed here is the SIGN: adverse
+        # for is_long is a falling underlying (see check_rebuy).
+        self.is_long = bool(start_long)
         self.cluster_id = 1
         self.legs: list[Leg] = []
         # Realized USD of legs that already left the cluster (expiry

@@ -157,11 +157,16 @@ def load_instrument_configs(loader: dict, config_dir: str) -> list[dict]:
         merged.update(own)
         merged["config_file"] = path
         out.append(merged)
-    symbols = [c["underlying"] for c in out]
-    if len(set(symbols)) != len(symbols):
+    # Identity is (underlying, direction), not underlying: one symbol may
+    # carry a put-credit-spread grid AND a call-credit-spread grid, which
+    # hold different contracts. Two grids on the SAME side of one symbol
+    # would fight over the same positions, so that stays an error.
+    names = [f"{c['underlying']}_{'long' if c.get('start_long', True) else 'short'}"
+             for c in out]
+    if len(set(names)) != len(names):
         raise AlpacaCliError(
-            f"config_path holds two configs for the same underlying: "
-            f"{sorted(symbols)}")
+            f"config_path holds two configs for the same underlying AND "
+            f"direction: {sorted(names)}")
     return out
 
 
@@ -179,6 +184,22 @@ class Instrument:
         self.cli = cli
         self.dry_run = dry_run
         self.underlying = config["underlying"]
+        # Direction of the grid. start_long=True is the BULLISH cluster,
+        # which in the credit-spread style is a PUT spread (the simulator
+        # makes the same mapping: backtest_options.py `right = "put" if
+        # core.is_long else "call"`). Adverse for it is a falling
+        # underlying, which is what KangarooCore.check_rebuy tests.
+        self.start_long = bool(config.get("start_long", True))
+        self.side = "long" if self.start_long else "short"
+        self.right = "put" if self.start_long else "call"
+        self.spread_kind = "put_spread" if self.start_long else "call_spread"
+        # The wing is further out of the money than the short strike: below
+        # it for puts, above it for calls.
+        self.wing_sign = -1 if self.start_long else 1
+        # Name = the instrument's identity everywhere a symbol alone would
+        # collide between the two directions: log prefix, state file,
+        # client_order_id.
+        self.name = f"{self.underlying}_{self.side}"
         self.poll_fill_seconds = float(config["poll_fill_seconds"])
         self.fill_requote_samples = int(config["fill_requote_samples"])
         self.dte_min = int(config["dte_min"])
@@ -189,7 +210,7 @@ class Instrument:
         # finds no state, opens a second grid on top of the live one and
         # never notices.
         raw = config.get("state_file") or os.path.join(
-            "state", f"kangaroo_{self.underlying.lower()}.json")
+            "state", f"kangaroo_{self.underlying.lower()}_{self.side}.json")
         self.state_file = raw if os.path.isabs(raw) else os.path.abspath(
             os.path.join(config_dir, raw))
         self.core = KangarooCore(
@@ -198,7 +219,7 @@ class Instrument:
             tp_pct=config["tp_pct"],
             initial_qty=config["initial_qty"],
             max_invest_count=config["max_invest_count"],
-            start_long=True,          # put-only: the direction never changes
+            start_long=self.start_long,
             max_adverse_pct=config["max_adverse_pct"],
         )
         # per-leg spread details, keyed by the SHORT leg's OCC symbol
@@ -206,7 +227,7 @@ class Instrument:
         self._market_was_open: bool | None = None
 
     def say(self, message: str, data_ts: str | None = None) -> None:
-        log(message, data_ts, who=self.underlying)
+        log(message, data_ts, who=self.name)
 
     # --- state persistence ----------------------------------------------
 
@@ -217,11 +238,11 @@ class Instrument:
             payload = json.load(fh)
         self.core.restore(payload["core"])
         self.leg_extras = payload["leg_extras"]
-        stored = payload.get("underlying")
-        if stored and stored != self.underlying:
+        stored = payload.get("name") or payload.get("underlying")
+        if stored and stored != self.name:
             raise AlpacaCliError(
                 f"state file {self.state_file} belongs to {stored}, not "
-                f"{self.underlying} - refusing to trade another symbol's "
+                f"{self.name} - refusing to trade another instrument's "
                 f"cluster")
         for leg in self.core.legs:
             if leg.option_symbol not in self.leg_extras:
@@ -235,7 +256,9 @@ class Instrument:
         extras = {leg.option_symbol: self.leg_extras[leg.option_symbol]
                   for leg in self.core.legs}
         atomic_write_json(self.state_file,
-                          {"underlying": self.underlying,
+                          {"name": self.name,
+                           "underlying": self.underlying,
+                           "start_long": self.start_long,
                            "core": self.core.to_dict(),
                            "leg_extras": extras})
 
@@ -272,10 +295,11 @@ class Instrument:
     # --- order helpers ---------------------------------------------------
 
     def coid(self, kind: str, leg_index: int) -> str:
-        """Client order id. Carries the INSTRUMENT: two instruments reach
-        the same cluster and leg counter independently, so without it their
-        ids collide inside one account."""
-        return (f"kang_{self.underlying}_c{self.core.cluster_id}"
+        """Client order id. Carries the INSTRUMENT, symbol AND direction:
+        instruments reach the same cluster and leg counter independently,
+        so without it a long and a short grid on one symbol collide on the
+        same id inside one account."""
+        return (f"kang_{self.name}_c{self.core.cluster_id}"
                 f"_l{leg_index}_{kind}")
 
     def wait_filled_or_cancel(self, order_id: str) -> dict | None:
@@ -314,17 +338,19 @@ class Instrument:
     def select_spread(self, spot_mid: float, today: date) -> dict:
         """Nearest expiration inside [dte_min, dte_max]; short strike
         nearest to spot; wing = first width candidate that exists as a
-        strike at that expiration. Prices come from live quotes."""
+        strike at that expiration, further out of the money than the short
+        strike (below it for puts, above it for calls). The contract side
+        follows the grid direction. Prices come from live quotes."""
         contracts = self.cli.option_contracts(
             self.underlying,
             (today + timedelta(days=self.dte_min)).isoformat(),
             (today + timedelta(days=self.dte_max)).isoformat(),
-            "put",
+            self.right,
         )
         tradable = [c for c in contracts if c["tradable"]]
         if not tradable:
             raise AlpacaCliError(
-                f"no tradable puts for {self.underlying} in "
+                f"no tradable {self.right}s for {self.underlying} in "
                 f"DTE [{self.dte_min},{self.dte_max}]")
         expiry = min(c["expiration_date"] for c in tradable)
         chain = {float(c["strike_price"]): c
@@ -332,13 +358,15 @@ class Instrument:
         short_strike = min(chain, key=lambda s: abs(s - spot_mid))
         wing_strike = None
         for width in self.spread_widths:
-            if short_strike - width in chain:
-                wing_strike = short_strike - width
+            candidate = short_strike + self.wing_sign * width
+            if candidate in chain:
+                wing_strike = candidate
                 break
         if wing_strike is None:
             raise AlpacaCliError(
-                f"no wing strike below {short_strike} (widths "
-                f"{self.spread_widths}) at {expiry}")
+                f"no wing strike "
+                f"{'below' if self.wing_sign < 0 else 'above'} "
+                f"{short_strike} (widths {self.spread_widths}) at {expiry}")
         occ_s = chain[short_strike]["symbol"]
         occ_w = chain[wing_strike]["symbol"]
         quotes = self.cli.option_quotes([occ_s, occ_w])
@@ -510,7 +538,8 @@ class Instrument:
             extra = self.leg_extras[leg.option_symbol]
             close = self.settlement_close(extra["expiry"])
             pnl, itm = settlement_pnl(
-                "put_spread", "put", extra["strike"], extra["wing_strike"],
+                self.spread_kind, self.right,
+                extra["strike"], extra["wing_strike"],
                 leg.entry_premium, leg.qty, close,
                 self.core.contract_multiplier)
             self.core.book_settled(pnl)

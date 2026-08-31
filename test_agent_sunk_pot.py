@@ -32,6 +32,7 @@ Run: python test_agent_sunk_pot.py
 import os
 import sys
 import tempfile
+from datetime import date
 
 import agent as agent_mod
 from agent import Instrument, load_instrument_configs
@@ -165,6 +166,87 @@ def test_client_order_id_carries_the_instrument():
                    tempfile.mkdtemp())
     assert a.coid("o", 0) != b.coid("o", 0), "ids would collide in one account"
     assert "AMD" in a.coid("o", 0) and "MSFT" in b.coid("o", 0)
+
+
+class ChainCli:
+    """Stub CLI holding one expiry with a whole-dollar strike grid."""
+
+    def __init__(self, right):
+        self.right = right
+        self.asked_right = None
+
+    def option_contracts(self, underlying, gte, lte, right):
+        self.asked_right = right
+        return [{"symbol": f"{underlying}260904{right[0].upper()}{k:05d}000",
+                 "strike_price": float(k), "expiration_date": "2026-09-04",
+                 "tradable": True} for k in range(760, 781)]
+
+    def option_quotes(self, occs):
+        # short leg richer than the wing, so the credit is positive
+        return {occ: {"bp": 2.00 - i, "ap": 2.10 - i, "t": "2026-08-31T13:35"}
+                for i, occ in enumerate(occs)}
+
+
+def _side_instrument(start_long, cli=None):
+    cfg = {"underlying": "SPY", "rebuy_1st_pct": 1.2, "rebuy_pct": 0.10,
+           "tp_pct": 0.10, "initial_qty": 1, "max_invest_count": 20,
+           "max_adverse_pct": 0.0, "dte_min": 4, "dte_max": 10,
+           "spread_widths": [5], "poll_fill_seconds": 2,
+           "fill_requote_samples": 30, "start_long": start_long}
+    return Instrument(cfg, cli, True, tempfile.mkdtemp(prefix="kang_side_"))
+
+
+def test_one_symbol_may_carry_both_directions():
+    folder = tempfile.mkdtemp(prefix="kang_both_")
+    with open(os.path.join(folder, "spy_long.yaml"), "w",
+              encoding="utf-8") as fh:
+        fh.write("underlying: SPY\nstart_long: true\n")
+    with open(os.path.join(folder, "spy_short.yaml"), "w",
+              encoding="utf-8") as fh:
+        fh.write("underlying: SPY\nstart_long: false\n")
+    got = load_instrument_configs({"config_path": folder, "tp_pct": 0.04}, ".")
+    assert len(got) == 2, got
+    assert {c["start_long"] for c in got} == {True, False}, got
+
+
+def test_two_grids_on_one_side_of_one_symbol_still_fail():
+    folder = tempfile.mkdtemp(prefix="kang_samesde_")
+    for name in ("a.yaml", "b.yaml"):
+        with open(os.path.join(folder, name), "w", encoding="utf-8") as fh:
+            fh.write("underlying: SPY\nstart_long: true\n")
+    try:
+        load_instrument_configs({"config_path": folder}, ".")
+    except agent_mod.AlpacaCliError as exc:
+        assert "direction" in str(exc), exc
+    else:
+        raise AssertionError("two long grids on SPY must fail loud")
+
+
+def test_the_two_directions_do_not_share_state_or_order_ids():
+    lo, sh = _side_instrument(True), _side_instrument(False)
+    assert lo.state_file != sh.state_file, lo.state_file
+    assert "long" in lo.state_file and "short" in sh.state_file
+    assert lo.coid("open", 0) != sh.coid("open", 0)
+
+
+def test_long_grid_sells_puts_with_the_wing_below():
+    cli = ChainCli("put")
+    inst = _side_instrument(True, cli)
+    spread = inst.select_spread(770.0, date(2026, 8, 31))
+    assert cli.asked_right == "put", cli.asked_right
+    assert spread["strike"] == 770.0, spread
+    assert spread["wing_strike"] == 765.0, spread
+    assert spread["credit_limit"] > 0, spread
+
+
+def test_short_grid_sells_calls_with_the_wing_above():
+    cli = ChainCli("call")
+    inst = _side_instrument(False, cli)
+    spread = inst.select_spread(770.0, date(2026, 8, 31))
+    assert cli.asked_right == "call", cli.asked_right
+    assert spread["strike"] == 770.0, spread
+    assert spread["wing_strike"] == 775.0, spread
+    assert spread["credit_limit"] > 0, spread
 
 
 def test_expired_leg_reaches_the_pot():
