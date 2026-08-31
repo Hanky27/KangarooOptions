@@ -381,6 +381,9 @@ def run(bars: list[dict], params: dict, dte_min: int, dte_max: int,
     on_cluster(cluster_dict): read-only observer called at every cluster
     end with the row just appended to the result."""
     core = KangarooCore(**params)
+    # Bound margin per bar. The peak alone cannot answer what several
+    # instruments require AT THE SAME TIME.
+    margin_series: list[tuple[str, float]] = []
     mult = core.contract_multiplier
     last_day = bars[-1]["t"][:10]
     daily = timeframe == "1Day"
@@ -605,6 +608,7 @@ def run(bars: list[dict], params: dict, dte_min: int, dte_max: int,
 
         margin = sum(leg_margin(l) for l in core.legs)
         stats["max_margin"] = max(stats["max_margin"], margin)
+        margin_series.append((stamp, margin))
         open_mark = (core.sunk_pot + sum(leg_pnl(l) for l in core.legs)
                      if core.legs else 0.0)
         equity.append((stamp, realized_total, open_mark))
@@ -621,6 +625,7 @@ def run(bars: list[dict], params: dict, dte_min: int, dte_max: int,
             "mark_usd": round(equity[-1][2], 2),
         }
     return {"clusters": clusters, "equity": equity, "stats": stats,
+            "margin": margin_series,
             "realized_total": realized_total, "open_book": open_book}
 
 
