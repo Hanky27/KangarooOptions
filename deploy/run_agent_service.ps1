@@ -59,8 +59,13 @@ $log = Join-Path $logDir ('agent_' + (Get-Date -Format 'yyyy-MM-dd') + '.log')
 
 Set-Location $RepoDir
 $commit = (& git -C $RepoDir rev-parse --short HEAD 2>$null)
+# $PID is THIS wrapper, not python - python has not been started yet when
+# the banner is written. Labelled as such so a log line can never be
+# mistaken for the agent's own pid; the agent logs its own pid itself when
+# it takes the instance lock.
 $banner = ("=== agent start " + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') +
-   " | commit " + $commit + " | pid " + $PID + " | user " + $env:USERNAME + " ===")
+   " | commit " + $commit + " | wrapper pid " + $PID +
+   " | user " + $env:USERNAME + " ===")
 Add-Content -Path $log -Value $banner -Encoding UTF8
 Write-Host $banner
 
