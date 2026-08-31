@@ -448,10 +448,23 @@ class Instrument:
 
     def select_spread(self, spot_mid: float, today: date) -> dict:
         """Nearest expiration inside [dte_min, dte_max]; short strike
-        nearest to spot; wing = first width candidate that exists as a
-        strike at that expiration, further out of the money than the short
-        strike (below it for puts, above it for calls). The contract side
-        follows the grid direction. Prices come from live quotes."""
+        nearest to spot; wing = the NEAREST EXISTING strike to each
+        configured width, further out of the money than the short strike
+        (below it for puts, above it for calls). The contract side follows
+        the grid direction. Prices come from live quotes.
+
+        NEAREST, not exact - this is the rule backtest_options.pick_spread
+        uses (`min(wing_side, key=lambda k: abs(k - want))`), and the two
+        have to agree or the bot trades something other than what was
+        measured. An exact-match rule cost TLT_long its whole day on
+        2026-08-31: with the short strike at 82.5 and a chain of whole
+        dollars below 80 but half dollars above, every configured width
+        landed on a half dollar that does not exist, and the instrument was
+        halted at 20 failed polls without ever opening.
+
+        Every distinct candidate is priced in ONE quote request and the
+        first with a positive marketable credit wins - the simulator also
+        requires a positive net credit before it accepts a pair."""
         contracts = self.cli.option_contracts(
             self.underlying,
             (today + timedelta(days=self.dte_min)).isoformat(),
@@ -467,28 +480,41 @@ class Instrument:
         chain = {float(c["strike_price"]): c
                  for c in tradable if c["expiration_date"] == expiry}
         short_strike = min(chain, key=lambda s: abs(s - spot_mid))
-        wing_strike = None
-        for width in self.spread_widths:
-            candidate = short_strike + self.wing_sign * width
-            if candidate in chain:
-                wing_strike = candidate
-                break
-        if wing_strike is None:
+        wing_side = [k for k in chain
+                     if (k > short_strike if self.wing_sign > 0
+                         else k < short_strike)]
+        if not wing_side:
             raise AlpacaCliError(
-                f"no wing strike "
+                f"no strike at all "
                 f"{'below' if self.wing_sign < 0 else 'above'} "
-                f"{short_strike} (widths {self.spread_widths}) at {expiry}")
+                f"{short_strike} at {expiry} for {self.underlying}")
+        candidates, seen = [], set()
+        for width in self.spread_widths:
+            want = short_strike + self.wing_sign * width
+            nearest = min(wing_side, key=lambda k: abs(k - want))
+            if nearest not in seen:
+                seen.add(nearest)
+                candidates.append(nearest)
         occ_s = chain[short_strike]["symbol"]
-        occ_w = chain[wing_strike]["symbol"]
-        quotes = self.cli.option_quotes([occ_s, occ_w])
-        for occ in (occ_s, occ_w):
+        wing_occs = [chain[k]["symbol"] for k in candidates]
+        quotes = self.cli.option_quotes([occ_s] + wing_occs)
+        if occ_s not in quotes:
+            raise AlpacaCliError(f"no quote for {occ_s}")
+        wing_strike, occ_w, credit_limit = None, None, None
+        rejected = []
+        for k, occ in zip(candidates, wing_occs):
             if occ not in quotes:
-                raise AlpacaCliError(f"no quote for {occ}")
-        credit_limit = quotes[occ_s]["bp"] - quotes[occ_w]["ap"]
-        if credit_limit <= 0:
+                rejected.append(f"{k}: no quote")
+                continue
+            credit = quotes[occ_s]["bp"] - quotes[occ]["ap"]
+            if credit > 0:
+                wing_strike, occ_w, credit_limit = k, occ, credit
+                break
+            rejected.append(f"{k}: credit {credit:+.2f}")
+        if occ_w is None:
             raise AlpacaCliError(
-                f"non-positive marketable credit {credit_limit} for "
-                f"{occ_s}/{occ_w} - refusing to sell")
+                f"no wing with a positive marketable credit against "
+                f"{occ_s} at {expiry} - tried {', '.join(rejected)}")
         return {
             "occ_short": occ_s, "occ_wing": occ_w,
             "strike": short_strike, "wing_strike": wing_strike,

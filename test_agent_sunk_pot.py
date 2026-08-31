@@ -393,6 +393,72 @@ def test_the_two_directions_do_not_share_state_or_order_ids():
     assert lo.coid("open", 0) != sh.coid("open", 0)
 
 
+class MixedGridCli:
+    """The TLT chain of 2026-09-02, measured against the broker: whole
+    dollars below 80, half dollars above. This is the shape that halted
+    TLT_long - the short strike lands on 82.5 and every configured width
+    points at a half dollar under 80 that does not exist."""
+
+    def __init__(self):
+        self.strikes = ([float(k) for k in range(70, 80)]
+                        + [80.0, 80.5, 81.0, 81.5, 82.0, 82.5, 83.0, 83.5])
+        self.asked = None
+
+    def option_contracts(self, underlying, gte, lte, right):
+        self.asked = right
+        return [{"symbol": f"TLT260902{right[0].upper()}{int(k * 1000):08d}",
+                 "strike_price": k, "expiration_date": "2026-09-02",
+                 "tradable": True} for k in self.strikes]
+
+    def option_quotes(self, occs):
+        # Short leg rich, every wing cheap -> a positive credit either way,
+        # so the test isolates the STRIKE choice and nothing else.
+        out = {}
+        for occ in occs:
+            rich = occ.endswith("00082500")
+            out[occ] = {"bp": 2.00 if rich else 0.20,
+                        "ap": 2.10 if rich else 0.30,
+                        "t": "2026-08-31T13:44"}
+        return out
+
+
+def test_wing_snaps_to_the_nearest_existing_strike():
+    """Exact-match wing selection halted a live instrument for a whole day.
+    The simulator takes the nearest EXISTING strike; the agent must too, or
+    the bot trades something other than what was measured."""
+    cli = MixedGridCli()
+    cfg = {"underlying": "TLT", "rebuy_1st_pct": 1.2, "rebuy_pct": 0.10,
+           "tp_pct": 0.10, "initial_qty": 1, "max_invest_count": 20,
+           "max_adverse_pct": 0.0, "dte_min": 1, "dte_max": 4,
+           "spread_widths": [5, 6, 4, 7, 3, 8, 10], "poll_fill_seconds": 2,
+           "fill_requote_samples": 30, "start_long": True}
+    inst = Instrument(cfg, cli, True, tempfile.mkdtemp(prefix="kang_wing_"))
+    spread = inst.select_spread(82.4, date(2026, 8, 31))
+    assert spread["strike"] == 82.5, spread
+    # 82.5 - 5 = 77.5 does not exist; 77.0 and 78.0 do. Nearest wins.
+    assert spread["wing_strike"] in (77.0, 78.0), spread
+    assert spread["wing_strike"] < spread["strike"], spread
+    assert spread["credit_limit"] > 0, spread
+
+
+def test_a_side_with_no_strike_at_all_still_fails_loud():
+    """Snapping to the nearest must not paper over an empty side."""
+    cli = MixedGridCli()
+    cli.strikes = [82.5, 83.0, 83.5]          # nothing below the short leg
+    cfg = {"underlying": "TLT", "rebuy_1st_pct": 1.2, "rebuy_pct": 0.10,
+           "tp_pct": 0.10, "initial_qty": 1, "max_invest_count": 20,
+           "max_adverse_pct": 0.0, "dte_min": 1, "dte_max": 4,
+           "spread_widths": [5], "poll_fill_seconds": 2,
+           "fill_requote_samples": 30, "start_long": True}
+    inst = Instrument(cfg, cli, True, tempfile.mkdtemp(prefix="kang_noside_"))
+    try:
+        inst.select_spread(82.4, date(2026, 8, 31))
+    except agent_mod.AlpacaCliError as exc:
+        assert "no strike at all" in str(exc), exc
+    else:
+        raise AssertionError("an empty wing side must fail loud")
+
+
 def test_long_grid_sells_puts_with_the_wing_below():
     cli = ChainCli("put")
     inst = _side_instrument(True, cli)
