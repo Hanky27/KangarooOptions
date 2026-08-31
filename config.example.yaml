@@ -24,7 +24,17 @@
 # environment, or point env_file at a KEY=VALUE file containing them.
 # The agent is paper-only: it refuses to start if ALPACA_LIVE_TRADE is set.
 
+# The instrument folder, resolved relative to THIS file. Every *.yaml in
+# it is one instrument that inherits the values below and overrides what it
+# names. Set it to "_" for a single instrument built from this file alone.
+config_path: configs
+
+# Default instrument, used only when config_path is "_".
 underlying: SPY
+
+# Grid direction: true = put credit spreads (bullish), false = call credit
+# spreads (bearish). One symbol may run both, as two separate configs.
+start_long: true
 
 # Grid parameters (carried over from the FX Kangaroo, tuning still open).
 rebuy_1st_pct: 1.2      # % underlying drop before the 1st rebuy
@@ -52,4 +62,6 @@ fill_requote_samples: 30
 # Paths.
 cli_path: /path/to/alpaca        # official Alpaca CLI binary (github.com/alpacahq/cli)
 env_file: null                   # optional KEY=VALUE file with the two API keys
-state_file: state/kangaroo_state.json
+# NOTE: no state_file when config_path names a folder - one file would be
+# shared by every instrument. Each defaults to
+# state/kangaroo_<symbol>_<side>.json.

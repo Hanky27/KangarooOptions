@@ -44,12 +44,16 @@ inflated every put-spread run): put-only +2,688 USD at -2,954 USD max
 drawdown, margin peak 2,000 USD (was +34,484 / -2,721 before the fix).
 Call-only is unaffected by the defect at -5,298 USD.
 
-Strategy per leg: SELL the ATM put, BUY a protective put ~5 $ lower (width
-probed over configured candidates) - one mleg LIMIT order at a marketable
-net-credit limit (short bid - wing ask). The grid logic is unchanged
-Kangaroo: rebuy on adverse (falling) underlying moves with 1.1^n growth,
-take-profit on the cluster's aggregated closeable P&L, direction never
-toggles (put-only).
+Strategy per leg: SELL the ATM option, BUY a protective wing ~5 $ further
+out of the money (width probed over configured candidates) - one mleg
+LIMIT order at a marketable net-credit limit (short bid - wing ask). The
+contract side follows the instrument's `start_long`: true = put credit
+spread (bullish), false = call credit spread (bearish); the wing sits
+below the short strike for puts and above it for calls. The grid logic is
+unchanged Kangaroo: rebuy on adverse underlying moves (falling for a put
+grid, rising for a call grid) with 1.1^n growth, take-profit on the
+cluster's aggregated closeable P&L, direction never toggles inside an
+instrument - a symbol traded both ways gets two instrument configs.
 
 Loop per poll, per instrument (close check first, never open in the same
 iteration):
@@ -154,6 +158,18 @@ def load_instrument_configs(loader: dict, config_dir: str) -> list[dict]:
                 f"{clash} - those describe the process, not the grid")
         merged = dict(loader)
         merged.pop("config_path", None)
+        # state_file is per instrument. Inheriting one from the loader
+        # would hand the SAME file to every instrument, so each would load
+        # the previous one's cluster and overwrite it on the next save -
+        # silently, with the positions of several symbols in one grid. An
+        # instrument may still name its own below.
+        if "state_file" in merged:
+            raise AlpacaCliError(
+                "the loader config sets state_file while config_path names "
+                "a folder: that one file would be shared by every "
+                "instrument. Drop it - each instrument defaults to "
+                "state/kangaroo_<symbol>_<side>.json - or set it inside "
+                "the individual configs.")
         merged.update(own)
         merged["config_file"] = path
         out.append(merged)
@@ -488,10 +504,12 @@ class Instrument:
             self.core.legs.remove(leg)
             self.save_state()
         ended, realized = self.core.cluster_id, self.core.sunk_pot
-        self.core.on_cluster_closed(toggle=False)   # put-only: no Mode1
+        # No Mode1: an instrument keeps its direction for its whole life.
+        self.core.on_cluster_closed(toggle=False)
         self.save_state()
         self.say(f"CLOSE cluster {ended}: realized {realized:.2f} USD "
-                 f"- restarting put grid (cluster {self.core.cluster_id})",
+                 f"- restarting {self.right} grid "
+                 f"(cluster {self.core.cluster_id})",
                  quote_ts)
 
     # --- gates -----------------------------------------------------------
@@ -659,9 +677,9 @@ class KangarooAgent:
             log(f"grid ready: cluster {inst.core.cluster_id}, "
                 f"legs={inst.core.invest_count}, "
                 f"state={os.path.basename(inst.state_file)}",
-                who=inst.underlying)
+                who=inst.name)
         log(f"agent start: {len(self.instruments)} instrument(s) "
-            f"[{', '.join(i.underlying for i in self.instruments)}], "
+            f"[{', '.join(i.name for i in self.instruments)}], "
             f"dry_run={self.dry_run}")
         while True:
             clock = self.cli.clock()

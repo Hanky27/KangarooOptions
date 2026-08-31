@@ -31,13 +31,22 @@ It is a deliberately stripped-down port of the author's cTrader
 ## Strategy
 
 Kangaroo is a pure grid - there is no entry signal. This port sells
-**put credit spreads** instead of trading the underlying:
+**credit spreads** instead of trading the underlying. Each instrument runs
+one direction, set by `start_long`:
 
-1. Sell an initial spread immediately: SHORT the ATM put, LONG a
-   protective put ~5 $ lower (one multi-leg limit order, net credit).
-2. Whenever the **underlying** drops by `rebuy_1st_pct` (first rebuy) or
-   `rebuy_pct` (all further rebuys) from the last leg's entry reference,
-   sell another spread with a growing size (`1.1^n`).
+| `start_long` | side | contract | profits while |
+|---|---|---|---|
+| `true` | long / bullish | **put** credit spread | the underlying holds or rises |
+| `false` | short / bearish | **call** credit spread | the underlying holds or falls |
+
+1. Sell an initial spread immediately: SHORT the ATM option, LONG a
+   protective wing ~5 $ further out of the money - below the short strike
+   for puts, above it for calls (one multi-leg limit order, net credit).
+2. Whenever the **underlying** moves against the cluster by
+   `rebuy_1st_pct` (first rebuy) or `rebuy_pct` (all further rebuys) from
+   the last leg's entry reference, sell another spread with a growing size
+   (`1.1^n`). Against means falling for a put grid, rising for a call
+   grid.
 3. Stop rebuying - but close nothing - once the underlying has run
    `max_adverse_pct` against the cluster's FIRST leg (0 disables it). The
    cluster keeps every position and still waits for its take profit; it
@@ -51,10 +60,59 @@ Kangaroo is a pure grid - there is no entry signal. This port sells
    the broker at the underlying's close of that day, and its realized USD
    joins the cluster's sunk pot. OTM expiry keeps the full credit. The
    cluster keeps living with its remaining legs.
-6. **Put-only:** after a cluster ends the grid restarts in the same
-   direction - there is no Mode1 toggle.
+6. **One direction per instrument:** after a cluster ends the grid
+   restarts on the same side - there is no Mode1 toggle. A symbol that
+   should be traded both ways gets two instrument configs.
 
 Trigger math always runs on the underlying quote, never on option premiums.
+
+## Instruments
+
+One process drives N instruments, in the loader shape the author's cTrader
+bots use. `config.yaml` is the **loader**: it holds the process-wide
+settings (CLI path, credentials file, sampling rates) and the grid defaults
+every instrument inherits. `config_path` names a folder; every `*.yaml` in
+it is one instrument that overrides what it names.
+
+    config.yaml            # loader: paths, poll rates, grid defaults
+    configs/
+      spy_short.yaml       # underlying + start_long + its own tuning
+      qqq_short.yaml
+      iwm_long.yaml
+      ...
+
+An instrument is identified by **(underlying, direction)**, so one symbol
+may carry a long and a short grid at once: they hold different contracts
+and never touch the same position. Each gets its own state file
+(`state/kangaroo_<symbol>_<side>.json`) and its own `client_order_id`
+namespace.
+
+Refused loud, because each would silently corrupt a live grid:
+
+- an instrument config that sets a process-wide key (`cli_path`,
+  `env_file`, `poll_seconds`, `poll_fill_seconds`, `fill_requote_samples`,
+  `config_path`) - those describe the process, not the grid;
+- two configs for the same underlying **and** direction - they would fight
+  over the same positions;
+- a `state_file` in the loader while `config_path` names a folder - that
+  one file would be shared by every instrument, so each would load the
+  previous one's cluster and overwrite it on the next save.
+
+Set `config_path: "_"` to fall back to a single instrument built from the
+loader itself.
+
+The clock and the position list are read **once per poll** for all
+instruments, not once per instrument.
+
+### Choosing the instruments
+
+`tools_week.py` measures every candidate (DTE window x take-profit x
+direction) per symbol over the last two trading weeks and reports **wins
+per week** - the objective for a contest scored over a single week, where
+a curve that needs months to straighten has no time to do so.
+`tools_make_configs.py` turns those measurements into the files above,
+admitting a side only if it is net positive over the window, and writes
+the measurement into each config as a comment.
 
 The configuration is the winner of an 11-run backtest sweep (SPY,
 2024-02..2026-08, real Alpaca option prices, daily resolution): the

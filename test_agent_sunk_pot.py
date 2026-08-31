@@ -222,6 +222,27 @@ def test_two_grids_on_one_side_of_one_symbol_still_fail():
         raise AssertionError("two long grids on SPY must fail loud")
 
 
+def test_loader_may_not_hand_one_state_file_to_every_instrument():
+    folder = tempfile.mkdtemp(prefix="kang_share_")
+    with open(os.path.join(folder, "spy.yaml"), "w", encoding="utf-8") as fh:
+        fh.write("underlying: SPY\n")
+    loader = {"config_path": folder, "state_file": "state/one.json"}
+    try:
+        load_instrument_configs(loader, ".")
+    except agent_mod.AlpacaCliError as exc:
+        assert "shared by every" in str(exc), exc
+    else:
+        raise AssertionError("one state file for N grids must fail loud")
+
+
+def test_an_instrument_may_still_name_its_own_state_file():
+    folder = tempfile.mkdtemp(prefix="kang_own_")
+    with open(os.path.join(folder, "spy.yaml"), "w", encoding="utf-8") as fh:
+        fh.write("underlying: SPY\nstate_file: state/mine.json\n")
+    got = load_instrument_configs({"config_path": folder}, ".")
+    assert got[0]["state_file"] == "state/mine.json", got
+
+
 def test_the_two_directions_do_not_share_state_or_order_ids():
     lo, sh = _side_instrument(True), _side_instrument(False)
     assert lo.state_file != sh.state_file, lo.state_file
