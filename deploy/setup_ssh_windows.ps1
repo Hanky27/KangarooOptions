@@ -119,9 +119,20 @@ else {
    Write-Host "    key appended ($($lines.Count) key(s) in the file)"
 }
 if ($isAdmin) {
-   # sshd REFUSES this file unless only SYSTEM and Administrators can write it.
-   icacls $keyFile /inheritance:r /grant 'SYSTEM:F' /grant 'Administratoren:F' /grant 'Administrators:F' 2>$null | Out-Null
-   Write-Host '    ACL restricted to SYSTEM + Administrators'
+   # sshd REFUSES this file unless only SYSTEM and Administrators can write
+   # it. Grant by SID, not by name: the group is "Administrators" on an
+   # English Windows and "Administratoren" on a German one, and icacls
+   # answers an unknown name with a non-zero exit plus stderr - which,
+   # under $ErrorActionPreference='Stop', aborts the whole script before
+   # the firewall and sshd_config steps ever run. Measured 2026-08-31 on
+   # FOREX12GB-1. SIDs are locale-independent:
+   #   *S-1-5-18     NT AUTHORITY\SYSTEM
+   #   *S-1-5-32-544 BUILTIN\Administrators
+   $acl = & icacls $keyFile /inheritance:r /grant '*S-1-5-18:F' '*S-1-5-32-544:F' 2>&1
+   if ($LASTEXITCODE -ne 0) {
+      throw ("icacls failed on $keyFile (exit $LASTEXITCODE):`n" + ($acl -join "`n"))
+   }
+   Write-Host '    ACL restricted to SYSTEM + Administrators (by SID)'
 }
 
 # --- 4. key-only ---------------------------------------------------------
