@@ -131,6 +131,120 @@ Suite: 27 agent tests, 21 core tests.
 
 ---
 
+### `5cac761` — a rebuy stepped onto its own wing
+
+**Symptom** (09:39-10:07 ET). `GOOGL_long` failed every poll and reached 15
+of its 20 strikes without opening leg 2.
+
+**Cause.** The rejected order, read out of the log:
+
+```
+GOOGL260904P00340000   sell   sell_to_open
+GOOGL260904P00335000   buy    buy_to_open
+```
+
+and in the account at that moment:
+
+```
+GOOGL260904P00340000   qty +1     <- the wing of leg 1
+GOOGL260904P00345000   qty -1     <- the short leg of leg 1
+```
+
+The rebuy wants to SELL the very contract leg 1 bought as its protective
+wing. The broker answers `422, code 42210000, "position intent mismatch,
+inferred: sell_to_close, specified: sell_to_open"` and it is right:
+selling one of a contract we are long one of does not open a short leg, it
+closes the wing. Forcing the intent through would net the wing away and
+leave the grid holding something other than the spread its state
+describes.
+
+Structural, not a GOOGL accident: the Kangaroo steps every rebuy further
+out of the money, so whenever that step equals the wing width the new
+short strike lands exactly on the previous leg's wing.
+
+**Fix.** `select_spread` receives the account snapshot the loader already
+reads once per poll and skips a short strike held LONG or a wing held
+SHORT. Without a snapshot the behaviour is unchanged — the guard never
+moves a strike on its own.
+
+**Confirmed.** After the restart at 16:11:04 CEST the instrument built
+three legs with no failures: 345/340, 337.5/332.5, and onward.
+
+### `2477d66` — three phantom clusters, and the level the fix belongs on
+
+**Symptom.** Three times the agent came back believing it held a cluster
+the account no longer had, then failed every poll towards its halt.
+
+**Cause**, measured from the order history against the stop times in the
+log banner:
+
+| instrument | close FILLED (UTC) | process stopped | gap |
+|---|---|---|---|
+| GOOGL_short | 13:46:18 | 13:47:13 | 55 s |
+| GOOGL_short | 14:10:31 | 14:11:04 | 33 s |
+| IWM_short | 14:15:49 | 14:16:24 | 35 s |
+
+Every one lands inside the 60 second fill window
+(`fill_requote_samples 30 x poll_fill_seconds 2`). `close_cluster` never
+returned from `wait_filled_or_cancel`, so it booked nothing, wrote no
+state and logged no CLOSE line. `wait_filled_or_cancel` itself is not at
+fault — it already accepts a late fill after cancelling
+(agent.py:429-435). It simply never got to run.
+
+**Two wrong turns before the right one**, both worth recording:
+
+1. *Guarding the deploy.* `update_and_restart.ps1` learned to wait for
+   zero open orders. But the script that performs a deploy is the one
+   already on disk, so a fix to it protects only the deploy AFTER the one
+   that ships it — the second phantom happened while the guard sat in the
+   repo, unused.
+2. *Narrowing the guard to one instrument.* For a state repair touching
+   only `GOOGL_short` I filtered the open-order check to
+   `kang_GOOGL_short_*`. But `Stop-ScheduledTask` ends the ONE process all
+   25 instruments live in: the check was instrument-scoped, the effect
+   process-wide. That produced the third phantom, on `IWM_short`.
+
+**Fix, at the right level.** Guarding the stop cannot work at all: a
+crash, a reboot or a dead VPS produces the same state with no script to
+ask first. The broker is the authority, and the `client_order_id` already
+carries what is needed to ask it —
+`kang_<INSTRUMENT>_c<cluster>_l<leg>_x_<stamp>`. On startup, before
+`reconcile` declares the state inconsistent, the agent looks for a FILLED
+close of its own current cluster. BOTH signals are required: the order AND
+no remaining position of that cluster. The order alone can mean a
+partially closed cluster; a missing position alone can be broker lag or a
+bad state file, and silently discarding a real cluster on that basis would
+be far worse than halting.
+
+**Confirmed.** The very first start on the new code recovered the open
+case without a human touching anything:
+
+```
+broker reports 120 order(s) since 2026-08-31
+IWM_short: RECOVERED cluster 7: the broker filled its close
+           (1 order, latest kang_IWM_short_c7_l0_x_1788185747981)
+           but this agent was stopped before it could book it
+agent start: 25 of 25 instrument(s) live
+```
+
+The two GOOGL clusters were not recovered: their state files had been
+moved aside by hand before this code existed. The money is in the account
+either way — only those two clusters' internal bookkeeping is gone, which
+is why the broker counted 26 closed clusters at 10:28 ET while the log
+counted 24.
+
+### Two sources, always
+
+Today produced the reason to stop trusting the agent's own log as a
+complete record. At 10:06 ET the log reported 15 closed clusters and
++267 USD; the broker's order history reported 16 and +436 USD for the same
+period. The missing one was the first phantom — a close that filled and
+was never written down.
+
+Since then every P&L figure in this project is read from the **broker's
+order history** first, with the log quoted only as a comparison. A log can
+have holes; today it demonstrably did.
+
 ## What these two have in common
 
 Both were invisible to the backtest, and for the same reason: the
