@@ -1,5 +1,5 @@
 @echo off
-title Kangaroo Options Agent - paper PA310P0ROWX0
+title Kangaroo Options Agent - paper PA3S85G7JUS0 (hackathon)
 cd /d C:\Users\HMz\Documents\Source\KangarooOptions
 if not exist logs mkdir logs
 echo === agent launch === >> "C:\Users\HMz\Documents\Source\KangarooOptions\logs\agent.log"
