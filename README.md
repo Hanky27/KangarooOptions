@@ -28,6 +28,47 @@ A martingale-style grid trading agent on US options, built for the
 It is a deliberately stripped-down port of the author's cTrader
 "Kangaroo" V2.2 Forex grid bot.
 
+## Hackathon submission
+
+Alpaca AI Trading Agents Hackathon (lablab.ai), 28 August - 4 September
+2026.
+
+| | |
+|---|---|
+| Competition paper account | **PA3S85G7JUS0** |
+| Account created | 2026-08-31, dedicated to this submission |
+| Starting balance | 100,000 USD |
+| Orders before the competition window | **none** - verified against the orders endpoint |
+| Alpaca interface | the official **CLI** (`alpaca`), pinned to v0.0.13 |
+| Options | credit spreads, multi-leg limit orders |
+| Market data | Alpaca Basic (indicative options feed) |
+
+### Disclosure of pre-event work
+
+The event FAQ permits work done before kick-off and requires it to be
+disclosed. What predates the hackathon:
+
+- **The strategy is a port.** Kangaroo is the author's own cTrader grid
+  bot ("Kangaroo V2.2", Forex). Its rules - rebuy on adverse moves with
+  `1.1^n` growth, cluster take-profit on aggregated P&L - were designed
+  long before this event. What was built *for* the event is the options
+  translation: credit spreads instead of spot, the expiry/settlement path,
+  the assignment gate, the multi-instrument loader, and every measurement
+  in this repository.
+- **One commit predates the kick-off.** `f4e8e3f`, 2026-08-28 16:41 CEST -
+  eighteen minutes before the 17:00 CEST start. It is the initial skeleton.
+  Everything from `fb66ce7` onwards was written during the event.
+- **The research harness is shared with the author's other work.** The
+  linearity metric used by `tools_sweep.py` is imported from a private
+  QuantroTrader module (`SignalEngine/optimizer/equity_shape.py`); the GUI
+  the backtests are shown in is that same private application. Neither is
+  part of this submission, and nothing in this repository requires them -
+  `tools_week.py`, `tools_portfolio.py` and `backtest_options.py` run
+  standalone.
+- **No LLM is in the trading loop.** The agent is deterministic. This is
+  stated plainly rather than dressed up: what is autonomous here is the
+  full decision-and-execution cycle, not a language model.
+
 ## Strategy
 
 Kangaroo is a pure grid - there is no entry signal. This port sells
