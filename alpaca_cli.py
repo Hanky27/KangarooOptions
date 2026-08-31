@@ -147,6 +147,25 @@ class AlpacaCli:
         body = self._run(["position", "list"])
         return body if body else []
 
+    def orders_since(self, iso_ts: str, limit: int = 500) -> list[dict]:
+        """Every order submitted after `iso_ts`, any status.
+
+        Used at startup to ask the broker what really happened to a close
+        the agent may not have lived long enough to book. There is no
+        lookup by client_order_id in the CLI (verified against
+        `order list --help`: --status, --limit, --after, --until,
+        --after-order-id only), so the window is fetched and filtered here.
+        A full page is an error rather than a silent truncation: the answer
+        would be missing exactly the orders it was asked about."""
+        body = self._run(["order", "list", "--status", "all",
+                          "--after", iso_ts, "--limit", str(limit)])
+        rows = body if isinstance(body, list) else (body.get("orders") or [])
+        if len(rows) >= limit:
+            raise AlpacaCliError(
+                f"orders_since({iso_ts}) hit the {limit} row limit - the "
+                f"list is truncated and a close could be missing from it")
+        return rows
+
     def order_get(self, order_id: str) -> dict:
         return self._run(["order", "get", "--order-id", order_id])
 

@@ -45,10 +45,12 @@ SETTLE_CLOSE = 767.00      # underlying close of the expiry day
 class StubCli:
     """Minimal stand-in for AlpacaCli: records calls, returns fixtures."""
 
-    def __init__(self, *, is_open: bool, timestamp: str, positions=None):
+    def __init__(self, *, is_open: bool, timestamp: str, positions=None,
+                 orders=None):
         self._is_open = is_open
         self._timestamp = timestamp
         self._positions = positions or []
+        self.orders = orders or []
         self.calls: list[str] = []
 
     def clock(self):
@@ -59,6 +61,10 @@ class StubCli:
     def positions(self):
         self.calls.append("positions")
         return list(self._positions)
+
+    def orders_since(self, iso_ts, limit=500):
+        self.calls.append("orders_since")
+        return list(self.orders)
 
     def account(self):
         self.calls.append("account")
@@ -118,6 +124,9 @@ class StubInstrument:
 
     def handle_expiries(self, day, positions):
         pass
+
+    def recover_unbooked_close(self, positions, orders):
+        return False
 
     def reconcile(self, positions):
         pass
@@ -530,6 +539,70 @@ def test_short_grid_sells_calls_with_the_wing_above():
     assert spread["strike"] == 770.0, spread
     assert spread["wing_strike"] == 775.0, spread
     assert spread["credit_limit"] > 0, spread
+
+
+def _closed_order(name, cluster, coid_kind="x"):
+    return {"status": "filled",
+            "client_order_id": f"kang_{name}_c{cluster}_l0_{coid_kind}_178"}
+
+
+def test_a_close_the_broker_filled_is_recovered_on_startup():
+    """Three times on 2026-08-31 a close order was FILLED while the agent
+    was being stopped inside its 60 s fill window, so close_cluster never
+    booked it. The agent came back believing it held a cluster the account
+    no longer had. The broker is the authority: a filled _x_ order for this
+    cluster plus no remaining position means the cluster ended."""
+    cli = StubCli(is_open=True, timestamp="2026-08-31T10:00:00-04:00")
+    a = make_agent(cli, legs=[("SPY260904P00770000", 2, 1.20,
+                               770.0, 765.0, "2026-09-04")])
+    before = a.core.cluster_id
+    ok = a.recover_unbooked_close({}, [_closed_order(a.name, before)])
+    assert ok is True
+    assert a.core.legs == [], a.core.legs
+    assert a.core.cluster_id == before + 1, a.core.cluster_id
+    assert a.leg_extras == {}
+
+
+def test_recovery_needs_BOTH_the_order_and_the_missing_position():
+    """Either signal alone is not enough. A filled close while a leg is
+    still held can be a partial close; a missing position without a close
+    order can be broker lag or a bad state file - discarding a real cluster
+    on that basis would be far worse than halting."""
+    cli = StubCli(is_open=True, timestamp="2026-08-31T10:00:00-04:00")
+
+    # order present, but a leg is still in the account -> no recovery
+    a = make_agent(cli, legs=[("SPY260904P00770000", 2, 1.20,
+                               770.0, 765.0, "2026-09-04")])
+    held = {"SPY260904P00770000": {"symbol": "SPY260904P00770000",
+                                   "qty": "-2"}}
+    assert a.recover_unbooked_close(held,
+                                    [_closed_order(a.name, 1)]) is False
+    assert len(a.core.legs) == 1
+
+    # position gone, but no close order -> no recovery either
+    b = make_agent(cli, legs=[("SPY260904P00770000", 2, 1.20,
+                               770.0, 765.0, "2026-09-04")])
+    assert b.recover_unbooked_close({}, []) is False
+    assert len(b.core.legs) == 1
+
+    # an OPEN order of the same cluster is not a close
+    c = make_agent(cli, legs=[("SPY260904P00770000", 2, 1.20,
+                               770.0, 765.0, "2026-09-04")])
+    assert c.recover_unbooked_close(
+        {}, [_closed_order(c.name, 1, coid_kind="o")]) is False
+    assert len(c.core.legs) == 1
+
+
+def test_recovery_ignores_another_instruments_close():
+    """The client_order_id carries instrument AND cluster; a close from a
+    different grid must not end this one."""
+    cli = StubCli(is_open=True, timestamp="2026-08-31T10:00:00-04:00")
+    a = make_agent(cli, legs=[("SPY260904P00770000", 2, 1.20,
+                               770.0, 765.0, "2026-09-04")])
+    foreign = [_closed_order("QQQ_short", 1),
+               _closed_order(a.name, a.core.cluster_id + 5)]
+    assert a.recover_unbooked_close({}, foreign) is False
+    assert len(a.core.legs) == 1
 
 
 def test_expired_leg_reaches_the_pot():

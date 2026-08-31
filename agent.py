@@ -362,6 +362,50 @@ class Instrument:
                            "core": self.core.to_dict(),
                            "leg_extras": extras})
 
+    def recover_unbooked_close(self, positions: dict,
+                               orders: list[dict]) -> bool:
+        """Book a close the broker filled but this agent never recorded.
+
+        Returns True when the cluster was advanced. Two conditions have to
+        hold together, and neither alone is enough:
+          - a FILLED order whose client_order_id names THIS instrument and
+            THIS cluster as a close (`_x_`), and
+          - not one of the cluster's legs still present in the account.
+        The order alone could belong to a partially closed cluster; the
+        missing position alone could be a broker lag or a bad state file,
+        and silently discarding a real cluster on that basis would be far
+        worse than halting.
+        """
+        if not self.core.legs:
+            return False
+        for leg in self.core.legs:
+            extra = self.leg_extras.get(leg.option_symbol) or {}
+            for occ in (leg.option_symbol, extra.get("wing_occ")):
+                if occ and occ in positions:
+                    return False          # something is still held
+        prefix = f"kang_{self.name}_c{self.core.cluster_id}_"
+        closes = [o for o in orders
+                  if o.get("status") == "filled"
+                  and (o.get("client_order_id") or "").startswith(prefix)
+                  and "_x_" in (o.get("client_order_id") or "")]
+        if not closes:
+            return False
+        ended = self.core.cluster_id
+        realized = self.core.sunk_pot
+        self.core.legs.clear()
+        self.core.on_cluster_closed(toggle=False)
+        self.leg_extras = {}
+        self.save_state()
+        self.say(
+            f"RECOVERED cluster {ended}: the broker filled its close "
+            f"({len(closes)} order(s), latest "
+            f"{closes[-1].get('client_order_id')}) but this agent was "
+            f"stopped before it could book it. No position of that cluster "
+            f"remains in the account. Booked {realized:+.2f} USD of already "
+            f"realized legs and moved on to cluster "
+            f"{self.core.cluster_id}.")
+        return True
+
     def reconcile(self, positions: dict) -> None:
         """Every spread leg in the state must exist in the account: the
         short put as a short position, the wing as a long position, each
@@ -834,6 +878,12 @@ class KangarooAgent:
             f"options_trading_level={account['options_trading_level']}")
         clock = self.cli.clock()
         positions = self.positions_by_symbol()
+        # One order query for all instruments, covering today. A close the
+        # agent failed to book can only have happened while it was running,
+        # so the session's own day is the whole search space.
+        recent_orders = self.cli.orders_since(clock["timestamp"][:10])
+        log(f"broker reports {len(recent_orders)} order(s) since "
+            f"{clock['timestamp'][:10]}")
         for inst in self.instruments:
             # Startup is where a RESTART fails: a state file that no longer
             # matches the account stops the instrument it belongs to, not
@@ -847,6 +897,10 @@ class KangarooAgent:
                 # just read and the agent could never restart after a
                 # settlement failure.
                 inst.handle_expiries(clock["timestamp"][:10], positions)
+                # Ask the BROKER before declaring the state inconsistent:
+                # a close it filled while this agent was being stopped is
+                # not a mismatch, it is a cluster that ended.
+                inst.recover_unbooked_close(positions, recent_orders)
                 inst.reconcile(positions)
             except Exception:                                # noqa: BLE001
                 inst.halted = True
