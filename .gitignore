@@ -5,3 +5,7 @@ __pycache__/
 *.pyc
 data/
 .env*
+
+# Built output of tools_perf_snapshot.py - published on the data branch,
+# never on the code branch (see deploy/publish_perf.ps1).
+docs/snapshot.json
