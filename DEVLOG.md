@@ -245,15 +245,33 @@ Since then every P&L figure in this project is read from the **broker's
 order history** first, with the log quoted only as a comparison. A log can
 have holes; today it demonstrably did.
 
-## What these two have in common
+## What these findings have in common
 
-Both were invisible to the backtest, and for the same reason: the
-simulator asks the broker *what exists* and prices it, while the live
-agent additionally has to *submit orders* and *re-submit* them. The
+Every one of them was invisible to the backtest, and for the same reason:
+the simulator asks the broker *what exists* and prices it, while the live
+agent additionally has to hold an account, *submit* orders, *re-submit*
+them, and survive being stopped between a fill and its booking. The
 research path and the execution path shared a strategy but not a code
-path, and both defects lived in the gap.
+path, and all five defects lived in that gap.
 
-The wing fix closed part of that gap by making the agent use the
-simulator's own rule. The order-id fix has no counterpart in the simulator
-at all — there are no order ids in a backtest, which is exactly why it
-could only ever be found live.
+Two of them were a genuine DIVERGENCE — the live agent was not running the
+strategy that had been measured — and both are now closed by making the
+agent use the simulator's own rule:
+
+- the wing had to match a width exactly, where the simulator snaps to the
+  nearest existing strike;
+- the rebuy could step onto a strike the account already held, which a
+  backtest can never notice because it has no account to net against.
+
+The rest have no counterpart in a simulator at all. A backtest has no
+order ids, no fill windows, and no process that can be killed between a
+fill and the booking of it. Those could only ever be found live — which is
+the honest answer to why a bot with 32 agent tests and 21 core tests still
+had five defects on its first trading morning, and why the tests written
+*after* each one are the part of this log that matters most.
+
+Every fix here carries a regression test that reproduces the live failure
+from the real data behind it: the TLT chain with its mixed dollar and
+half-dollar grid, the GOOGL leg-on-its-own-wing collision, a filled close
+with no remaining position. The suite could not have found them first;
+it can keep them from coming back.
