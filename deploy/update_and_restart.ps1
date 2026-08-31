@@ -95,6 +95,51 @@ Say '--- what changes ---'
 & git -C $RepoDir merge --ff-only --quiet origin/main
 Say ("checkout now at " + (& git -C $RepoDir rev-parse --short HEAD))
 
+# --- 1b. never stop while an order is in flight -------------------------
+# Measured 2026-08-31: a deploy killed the agent 55 s after it had
+# submitted a close, INSIDE the 60 s fill window (fill_requote_samples 30 x
+# poll_fill_seconds 2). The broker filled the order at 15:46:18; the agent
+# never returned from wait_filled_or_cancel, so close_cluster booked
+# nothing, wrote no state and logged no CLOSE line - leaving a PHANTOM
+# cluster: state claiming a position the account no longer held.
+# Waiting for the process to exit is not enough; the account has to be
+# quiet too.
+$cli = Join-Path (Split-Path $RepoDir -Parent) 'AlpacaTools\cli\alpaca.exe'
+$envFile = Join-Path $RepoDir '.env.hackathon'
+function Open-OrderCount {
+   if (-not (Test-Path $cli)) { return -1 }
+   foreach ($line in (Get-Content $envFile -ErrorAction SilentlyContinue)) {
+      if ($line -match '^\s*([A-Z_]+)\s*=\s*(.+)$') {
+         Set-Item -Path ("env:" + $Matches[1]) -Value $Matches[2].Trim()
+      }
+   }
+   $out = & $cli order list --status open --limit 100 -q 2>$null
+   if ($LASTEXITCODE -ne 0) { return -1 }
+   try { $j = ($out | Out-String | ConvertFrom-Json) } catch { return -1 }
+   $rows = if ($j -is [array]) { $j } elseif ($j.orders) { $j.orders } else { @() }
+   return @($rows).Count
+}
+$n = Open-OrderCount
+if ($n -lt 0) {
+   throw ("cannot read the open-order list - refusing to restart blind. " +
+      "A deploy during an in-flight order is what creates a phantom cluster.")
+}
+Say ("open orders : $n")
+if ($n -gt 0) {
+   $deadline = (Get-Date).AddSeconds($MaxWaitSeconds)
+   while ($n -gt 0 -and (Get-Date) -lt $deadline) {
+      Start-Sleep -Seconds 3
+      $n = Open-OrderCount
+      Say ("  still $n open ...")
+   }
+   if ($n -ne 0) {
+      throw ("$n order(s) still in flight after $MaxWaitSeconds s. NOT " +
+         "restarting - a kill inside the fill window loses the booking of " +
+         "an order the broker has already filled.")
+   }
+}
+Say 'account quiet - safe to restart'
+
 # --- 2. stop, and wait for the PROCESS, not the task --------------------
 Say 'stopping the agent'
 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
