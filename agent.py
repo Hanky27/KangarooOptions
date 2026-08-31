@@ -120,6 +120,78 @@ PROCESS_KEYS = ("cli_path", "env_file", "poll_seconds", "poll_fill_seconds",
 HALT_AFTER = 20
 
 
+class SingleInstance:
+    """An exclusive lock on one file, released by the OS on process death.
+
+    Windows and POSIX expose this differently (msvcrt.locking against
+    fcntl.flock) but both give the same guarantee, which a PID file does
+    not: a process that is killed -9, bluescreens or loses power leaves NO
+    lock behind, while a live one cannot be doubled. That matters because
+    the watchdog's whole job is to start the agent when it looks dead.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = os.path.abspath(path)
+        self.handle = None
+
+    # msvcrt.locking() locks ONE BYTE AT THE CURRENT FILE POSITION, and a
+    # locked byte cannot be written even through the handle that holds the
+    # lock. Locking byte 0 and then writing the pid there fails with
+    # PermissionError - measured 2026-08-31. So the lock sits far past any
+    # content: Windows happily locks a region beyond end-of-file, and the
+    # pid is written at offset 0 where nothing is locked.
+    LOCK_OFFSET = 1 << 20
+
+    def acquire(self) -> None:
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        if not os.path.exists(self.path):
+            open(self.path, "a").close()
+        # "r+" and not "a+": in append mode every write goes to the end of
+        # the file regardless of seek, so the pid would pile up instead of
+        # replacing the previous one.
+        self.handle = open(self.path, "r+")
+        try:
+            if os.name == "nt":
+                import msvcrt
+                self.handle.seek(self.LOCK_OFFSET)
+                msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.handle.fileno(),
+                            fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self.handle.close()
+            self.handle = None
+            try:
+                with open(self.path, "r") as fh:
+                    other = fh.read(64).strip() or "unknown"
+            except OSError:
+                other = "unknown"
+            raise AlpacaCliError(
+                f"another agent already holds {self.path} (it recorded "
+                f"pid {other}). Two processes on one set of state files "
+                f"would each overwrite the other's cluster - refusing to "
+                f"start. Stop that process first.")
+        self.handle.seek(0)
+        self.handle.truncate()
+        self.handle.write(str(os.getpid()))
+        self.handle.flush()
+        os.fsync(self.handle.fileno())
+
+    def release(self) -> None:
+        if self.handle is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+                self.handle.seek(self.LOCK_OFFSET)
+                msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        self.handle.close()
+        self.handle = None
+
+
 def log(message: str, data_ts: str | None = None,
         who: str | None = None) -> None:
     prefix = f"[{data_ts}] " if data_ts else ""
@@ -785,7 +857,24 @@ def main() -> int:
 
     agent = KangarooAgent(config, dry_run=args.dry_run,
                           config_path=args.config)
-    agent.run(once=args.once)
+
+    # One live agent per config, enforced by the OS. The watchdog that keeps
+    # the run alive over several days works by starting the agent whenever
+    # it looks dead - so the only thing standing between a false positive
+    # and two processes writing the same state files is this lock. A dry run
+    # touches no state and no account, so it is exempt.
+    lock = None
+    if not args.dry_run:
+        lock = SingleInstance(
+            os.path.join(os.path.dirname(os.path.abspath(args.config)),
+                         "state", "agent.lock"))
+        lock.acquire()
+        log(f"instance lock held: {lock.path} (pid {os.getpid()})")
+    try:
+        agent.run(once=args.once)
+    finally:
+        if lock is not None:
+            lock.release()
     return 0
 
 

@@ -35,7 +35,8 @@ import tempfile
 from datetime import date
 
 import agent as agent_mod
-from agent import Instrument, load_instrument_configs
+from agent import (Instrument, SingleInstance,
+                   load_instrument_configs)
 from kangaroo_core import settlement_pnl
 
 SETTLE_CLOSE = 767.00      # underlying close of the expiry day
@@ -178,6 +179,62 @@ def test_a_startup_failure_halts_only_that_instrument():
     assert bad.steps == 0, "a halted instrument must not trade"
     assert good.steps == 2, f"healthy instrument stepped {good.steps}/2"
     assert any("HALTED AT STARTUP" in m for m in bad.said), bad.said
+
+
+def test_one_agent_at_a_time():
+    """The watchdog restarts the agent whenever it looks dead, so this lock
+    is the only thing between a false positive and two processes writing
+    the same state files."""
+    lp = os.path.join(tempfile.mkdtemp(prefix="kang_lock_"), "agent.lock")
+    first = SingleInstance(lp)
+    first.acquire()
+    with open(lp) as fh:
+        assert fh.read(64).strip() == str(os.getpid())
+    try:
+        SingleInstance(lp).acquire()
+    except agent_mod.AlpacaCliError as exc:
+        assert str(os.getpid()) in str(exc), exc
+    else:
+        raise AssertionError("a second agent must not get the lock")
+    first.release()
+    again = SingleInstance(lp)
+    again.acquire()          # released -> the next process may have it
+    again.release()
+
+
+HOLDER_SRC = (
+    "import sys, time\n"
+    "sys.path.insert(0, sys.argv[1])\n"
+    "from agent import SingleInstance\n"
+    "s = SingleInstance(sys.argv[2]); s.acquire()\n"
+    "print('held', flush=True)\n"
+    "time.sleep(120)\n"
+)
+
+
+def test_a_killed_agent_leaves_no_lock_behind():
+    """A pid file would survive a kill and lie. An OS lock does not: the
+    kernel drops it however the process dies, so a crashed agent can be
+    restarted while a live one still cannot be doubled."""
+    import subprocess
+    repo = os.path.dirname(os.path.abspath(agent_mod.__file__))
+    lp = os.path.join(tempfile.mkdtemp(prefix="kang_kill_"), "agent.lock")
+    proc = subprocess.Popen([sys.executable, "-c", HOLDER_SRC, repo, lp],
+                            stdout=subprocess.PIPE, text=True)
+    try:
+        assert proc.stdout.readline().strip() == "held", "holder did not start"
+        try:
+            SingleInstance(lp).acquire()
+        except agent_mod.AlpacaCliError:
+            pass
+        else:
+            raise AssertionError("the live holder must block a second agent")
+    finally:
+        proc.kill()
+        proc.wait()
+    survivor = SingleInstance(lp)
+    survivor.acquire()       # must NOT raise - the kill freed the lock
+    survivor.release()
 
 
 def test_loader_without_config_path_yields_one_instrument():
