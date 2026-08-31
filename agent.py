@@ -19,7 +19,18 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Kangaroo Options agent - put-credit-spread grid on Alpaca paper trading.
+"""Kangaroo Options agent - put-credit-spread grids on Alpaca paper trading.
+
+MULTI-INSTRUMENT, in the loader shape the author's cTrader bots use
+(QuantroTrader CLAUDE.md REGEL 0.7 / §13 "Loader-Sentinel-Pattern"):
+config.yaml is the LOADER and carries the shared defaults; `config_path`
+points at a folder holding ONE config per instrument, each separately
+optimised and overriding only what differs. One process drives them all -
+a single CLI, a single market clock, a single account, and one independent
+grid per instrument with its own cluster state and its own state file.
+
+    config_path: "_" or absent  -> one instrument, the loader's own values
+    config_path: instruments/   -> one instrument per *.yaml in that folder
 
 Configuration chosen from the backtest sweep of 2026-08-28 (SPY,
 2024-02..2026-08, real Alpaca option prices): the PUT-ONLY grid selling PUT
@@ -31,8 +42,7 @@ RE-MEASURED 2026-08-29 after the wing-mark defect fix (backtest_options.py
 marked put-spread wings at their ENTRY price for the whole leg life, which
 inflated every put-spread run): put-only +2,688 USD at -2,954 USD max
 drawdown, margin peak 2,000 USD (was +34,484 / -2,721 before the fix).
-Call-only is unaffected by the defect at -5,298 USD. The parameter set has
-NOT been re-tuned against the corrected numbers yet.
+Call-only is unaffected by the defect at -5,298 USD.
 
 Strategy per leg: SELL the ATM put, BUY a protective put ~5 $ lower (width
 probed over configured candidates) - one mleg LIMIT order at a marketable
@@ -41,7 +51,8 @@ Kangaroo: rebuy on adverse (falling) underlying moves with 1.1^n growth,
 take-profit on the cluster's aggregated closeable P&L, direction never
 toggles (put-only).
 
-Loop per poll (close check first, never open in the same iteration):
+Loop per poll, per instrument (close check first, never open in the same
+iteration):
   0. assignment gate - an ASSIGNED underlying stock position is flattened
      at market before anything else, so no leg is settled while the stock
      it produced is still on the books
@@ -63,8 +74,10 @@ Loop per poll (close check first, never open in the same iteration):
 Orders: mleg LIMIT day orders (order form verified on the paper account
 2026-08-28). An order that does not fill within fill_requote_samples polls
 is canceled BY ID and re-quoted on the next loop - never left dangling,
-never cancel-all. Log lines describing market decisions carry the QUOTE
-timestamp, not the wall clock.
+never cancel-all. Every client_order_id carries the INSTRUMENT, because
+two instruments reach the same cluster/leg counter independently. Log
+lines describing market decisions carry the QUOTE timestamp, not the wall
+clock, and are prefixed with the instrument.
 
 Usage:
   python agent.py --config config.yaml [--once] [--dry-run]
@@ -73,6 +86,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import sys
@@ -88,10 +102,17 @@ from kangaroo_core import KangarooCore, settlement_pnl
 TERMINAL_BAD = {"canceled", "expired", "rejected", "done_for_day",
                 "stopped", "suspended", "replaced"}
 
+# Keys the loader supplies once for the whole run; an instrument config may
+# not override them because they describe the PROCESS, not the grid.
+PROCESS_KEYS = ("cli_path", "env_file", "poll_seconds", "poll_fill_seconds",
+                "fill_requote_samples", "config_path")
 
-def log(message: str, data_ts: str | None = None) -> None:
+
+def log(message: str, data_ts: str | None = None,
+        who: str | None = None) -> None:
     prefix = f"[{data_ts}] " if data_ts else ""
-    print(f"{prefix}{message}", flush=True)
+    tag = f"{who}: " if who else ""
+    print(f"{prefix}{tag}{message}", flush=True)
 
 
 def atomic_write_json(path: str, payload: dict) -> None:
@@ -101,19 +122,76 @@ def atomic_write_json(path: str, payload: dict) -> None:
     os.replace(tmp, path)
 
 
-class KangarooAgent:
-    def __init__(self, config: dict, dry_run: bool) -> None:
+def load_instrument_configs(loader: dict, config_dir: str) -> list[dict]:
+    """The loader's instruments, in the cTrader ConfigPath shape.
+
+    `config_path` absent or "_" -> a single instrument built from the
+    loader itself (the behaviour before multi-instrument). Otherwise every
+    *.yaml in that folder is one instrument: it inherits the loader's
+    values and overrides what it names, exactly like a per-symbol cbotset
+    overriding a loader cbotset. The folder path is resolved relative to
+    the loader config, never to the current working directory - a start
+    from the wrong folder must not silently trade a different set.
+    """
+    raw = loader.get("config_path")
+    if raw in (None, "", "_"):
+        return [dict(loader)]
+    folder = raw if os.path.isabs(raw) else os.path.join(config_dir, raw)
+    if not os.path.isdir(folder):
+        raise AlpacaCliError(f"config_path is not a folder: {folder}")
+    files = sorted(glob.glob(os.path.join(folder, "*.yaml"))
+                   + glob.glob(os.path.join(folder, "*.yml")))
+    if not files:
+        raise AlpacaCliError(f"config_path holds no *.yaml: {folder}")
+    out = []
+    for path in files:
+        with open(path, "r", encoding="utf-8") as fh:
+            own = yaml.safe_load(fh) or {}
+        clash = [k for k in PROCESS_KEYS if k in own]
+        if clash:
+            raise AlpacaCliError(
+                f"{os.path.basename(path)} sets loader-only key(s) "
+                f"{clash} - those describe the process, not the grid")
+        merged = dict(loader)
+        merged.pop("config_path", None)
+        merged.update(own)
+        merged["config_file"] = path
+        out.append(merged)
+    symbols = [c["underlying"] for c in out]
+    if len(set(symbols)) != len(symbols):
+        raise AlpacaCliError(
+            f"config_path holds two configs for the same underlying: "
+            f"{sorted(symbols)}")
+    return out
+
+
+class Instrument:
+    """One underlying: its own grid, its own cluster state, its own file.
+
+    Holds no I/O of its own - the CLI and the market clock belong to the
+    loader and are handed in, so N instruments cost one clock call per
+    poll, not N.
+    """
+
+    def __init__(self, config: dict, cli: AlpacaCli, dry_run: bool,
+                 config_dir: str) -> None:
         self.cfg = config
+        self.cli = cli
         self.dry_run = dry_run
         self.underlying = config["underlying"]
-        self.poll_seconds = float(config["poll_seconds"])
         self.poll_fill_seconds = float(config["poll_fill_seconds"])
         self.fill_requote_samples = int(config["fill_requote_samples"])
         self.dte_min = int(config["dte_min"])
         self.dte_max = int(config["dte_max"])
         self.spread_widths = [int(w) for w in config["spread_widths"]]
-        self.state_file = config["state_file"]
-        self.cli = AlpacaCli(config["cli_path"], config.get("env_file"))
+        # State path: per instrument and ABSOLUTE. A relative path resolved
+        # against the working directory means a start from the wrong folder
+        # finds no state, opens a second grid on top of the live one and
+        # never notices.
+        raw = config.get("state_file") or os.path.join(
+            "state", f"kangaroo_{self.underlying.lower()}.json")
+        self.state_file = raw if os.path.isabs(raw) else os.path.abspath(
+            os.path.join(config_dir, raw))
         self.core = KangarooCore(
             rebuy_1st_pct=config["rebuy_1st_pct"],
             rebuy_pct=config["rebuy_pct"],
@@ -127,6 +205,9 @@ class KangarooAgent:
         self.leg_extras: dict[str, dict] = {}
         self._market_was_open: bool | None = None
 
+    def say(self, message: str, data_ts: str | None = None) -> None:
+        log(message, data_ts, who=self.underlying)
+
     # --- state persistence ----------------------------------------------
 
     def load_state(self) -> None:
@@ -136,27 +217,36 @@ class KangarooAgent:
             payload = json.load(fh)
         self.core.restore(payload["core"])
         self.leg_extras = payload["leg_extras"]
+        stored = payload.get("underlying")
+        if stored and stored != self.underlying:
+            raise AlpacaCliError(
+                f"state file {self.state_file} belongs to {stored}, not "
+                f"{self.underlying} - refusing to trade another symbol's "
+                f"cluster")
         for leg in self.core.legs:
             if leg.option_symbol not in self.leg_extras:
                 raise AlpacaCliError(
                     f"state file has no spread details for {leg.option_symbol}")
-        log(f"state restored: cluster {self.core.cluster_id} "
-            f"legs={self.core.invest_count}")
+        self.say(f"state restored: cluster {self.core.cluster_id} "
+                 f"legs={self.core.invest_count}")
 
     def save_state(self) -> None:
         os.makedirs(os.path.dirname(self.state_file) or ".", exist_ok=True)
         extras = {leg.option_symbol: self.leg_extras[leg.option_symbol]
                   for leg in self.core.legs}
         atomic_write_json(self.state_file,
-                          {"core": self.core.to_dict(), "leg_extras": extras})
+                          {"underlying": self.underlying,
+                           "core": self.core.to_dict(),
+                           "leg_extras": extras})
 
-    def reconcile(self) -> None:
+    def reconcile(self, positions: dict) -> None:
         """Every spread leg in the state must exist in the account: the
         short put as a short position, the wing as a long position, each
-        with at least the leg's quantity. Any mismatch aborts."""
+        with at least the leg's quantity. Any mismatch aborts. `positions`
+        is the account-wide snapshot the loader read once for all
+        instruments."""
         if not self.core.legs:
             return
-        positions = {p["symbol"]: p for p in self.cli.positions()}
 
         def held(occ: str, want_short: bool, qty: int) -> bool:
             p = positions.get(occ)
@@ -170,14 +260,23 @@ class KangarooAgent:
             extra = self.leg_extras[leg.option_symbol]
             if not held(leg.option_symbol, True, leg.qty):
                 raise AlpacaCliError(
-                    f"state/positions mismatch: short leg {leg.option_symbol} "
-                    f"x{leg.qty} not present as short - refusing to trade")
+                    f"{self.underlying}: state/positions mismatch: short leg "
+                    f"{leg.option_symbol} x{leg.qty} not present as short - "
+                    f"refusing to trade")
             if not held(extra["wing_occ"], False, leg.qty):
                 raise AlpacaCliError(
-                    f"state/positions mismatch: wing {extra['wing_occ']} "
-                    f"x{leg.qty} not present as long - refusing to trade")
+                    f"{self.underlying}: state/positions mismatch: wing "
+                    f"{extra['wing_occ']} x{leg.qty} not present as long - "
+                    f"refusing to trade")
 
     # --- order helpers ---------------------------------------------------
+
+    def coid(self, kind: str, leg_index: int) -> str:
+        """Client order id. Carries the INSTRUMENT: two instruments reach
+        the same cluster and leg counter independently, so without it their
+        ids collide inside one account."""
+        return (f"kang_{self.underlying}_c{self.core.cluster_id}"
+                f"_l{leg_index}_{kind}")
 
     def wait_filled_or_cancel(self, order_id: str) -> dict | None:
         """Poll one order until filled. After fill_requote_samples polls the
@@ -197,7 +296,7 @@ class KangarooAgent:
             if order["status"] == "filled":
                 return order            # raced a late fill - accept it
             if order["status"] in TERMINAL_BAD:
-                log(f"order {order_id} canceled unfilled - will re-quote")
+                self.say(f"order {order_id} canceled unfilled - will re-quote")
                 return None
             time.sleep(self.poll_fill_seconds)
 
@@ -212,11 +311,10 @@ class KangarooAgent:
 
     # --- spread selection ------------------------------------------------
 
-    def select_spread(self, spot_mid: float) -> dict:
+    def select_spread(self, spot_mid: float, today: date) -> dict:
         """Nearest expiration inside [dte_min, dte_max]; short strike
         nearest to spot; wing = first width candidate that exists as a
         strike at that expiration. Prices come from live quotes."""
-        today = date.fromisoformat(self.cli.clock()["timestamp"][:10])
         contracts = self.cli.option_contracts(
             self.underlying,
             (today + timedelta(days=self.dte_min)).isoformat(),
@@ -261,9 +359,10 @@ class KangarooAgent:
 
     # --- trading actions -------------------------------------------------
 
-    def open_leg(self, qty: int, spot_bid: float, spot_ask: float) -> None:
-        spread = self.select_spread((spot_bid + spot_ask) / 2.0)
-        coid = f"kang_c{self.core.cluster_id}_l{self.core.invest_count}_o"
+    def open_leg(self, qty: int, spot_bid: float, spot_ask: float,
+                 today: date) -> None:
+        spread = self.select_spread((spot_bid + spot_ask) / 2.0, today)
+        coid = self.coid("o", self.core.invest_count)
         legs = [
             {"symbol": spread["occ_short"], "ratio_qty": "1",
              "side": "sell", "position_intent": "sell_to_open"},
@@ -274,9 +373,9 @@ class KangarooAgent:
         if self.dry_run:
             body = self.cli.submit_mleg_limit(legs, qty, limit, coid,
                                               dry_run=True)
-            log(f"DRY-RUN would sell {qty}x put credit spread "
-                f"{spread['occ_short']}/{spread['occ_wing']} "
-                f"limit {limit}: {body}", spread["quote_ts"])
+            self.say(f"DRY-RUN would sell {qty}x put credit spread "
+                     f"{spread['occ_short']}/{spread['occ_wing']} "
+                     f"limit {limit}: {body}", spread["quote_ts"])
             return
         order = self.cli.submit_mleg_limit(legs, qty, limit, coid)
         filled = self.wait_filled_or_cancel(order["id"])
@@ -293,11 +392,12 @@ class KangarooAgent:
             "wing_strike": spread["wing_strike"], "expiry": spread["expiry"],
         }
         self.save_state()
-        log(f"OPEN leg {self.core.invest_count}/{self.core.max_invest_count} "
-            f"cluster {self.core.cluster_id}: sold {qty}x "
-            f"{spread['occ_short']}/{spread['occ_wing']} "
-            f"credit {net_credit:.2f} (underlying "
-            f"{self.core.legs[-1].entry_underlying})", spread["quote_ts"])
+        self.say(f"OPEN leg {self.core.invest_count}/"
+                 f"{self.core.max_invest_count} cluster "
+                 f"{self.core.cluster_id}: sold {qty}x "
+                 f"{spread['occ_short']}/{spread['occ_wing']} "
+                 f"credit {net_credit:.2f} (underlying "
+                 f"{self.core.legs[-1].entry_underlying})", spread["quote_ts"])
 
     def closeable_pnl(self) -> tuple[float, dict, str]:
         """(cluster P&L closeable NOW, per-leg net close costs, quote ts).
@@ -323,13 +423,13 @@ class KangarooAgent:
 
     def close_cluster(self, costs: dict, quote_ts: str) -> None:
         if self.dry_run:
-            log(f"DRY-RUN would close cluster {self.core.cluster_id} "
-                f"({self.core.invest_count} legs)", quote_ts)
+            self.say(f"DRY-RUN would close cluster {self.core.cluster_id} "
+                     f"({self.core.invest_count} legs)", quote_ts)
             return
         remaining = list(self.core.legs)
         for i, leg in enumerate(remaining):
             extra = self.leg_extras[leg.option_symbol]
-            coid = f"kang_c{self.core.cluster_id}_l{i}_x"
+            coid = self.coid("x", i)
             legs = [
                 {"symbol": leg.option_symbol, "ratio_qty": "1",
                  "side": "buy", "position_intent": "buy_to_close"},
@@ -342,8 +442,9 @@ class KangarooAgent:
             if filled is None:
                 # partial close is a consistent state: keep the rest,
                 # the TP check will fire again on the next loop
-                log(f"close of {leg.option_symbol} did not fill - "
-                    f"keeping remaining legs, re-quoting next loop", quote_ts)
+                self.say(f"close of {leg.option_symbol} did not fill - "
+                         f"keeping remaining legs, re-quoting next loop",
+                         quote_ts)
                 self.save_state()
                 return
             fill_s, fill_w = self._leg_fills(filled, leg.option_symbol,
@@ -361,9 +462,9 @@ class KangarooAgent:
         ended, realized = self.core.cluster_id, self.core.sunk_pot
         self.core.on_cluster_closed(toggle=False)   # put-only: no Mode1
         self.save_state()
-        log(f"CLOSE cluster {ended}: realized {realized:.2f} USD "
-            f"- restarting put grid (cluster {self.core.cluster_id})",
-            quote_ts)
+        self.say(f"CLOSE cluster {ended}: realized {realized:.2f} USD "
+                 f"- restarting put grid (cluster {self.core.cluster_id})",
+                 quote_ts)
 
     # --- gates -----------------------------------------------------------
 
@@ -383,7 +484,7 @@ class KangarooAgent:
                 f"{self.underlying} close on {expiry} is {close}")
         return close
 
-    def handle_expiries(self, clock_date: str) -> None:
+    def handle_expiries(self, clock_date: str, positions: dict) -> None:
         """User rule: let legs expire. A leg past its expiration date was
         settled by the broker overnight; book its realized USD into the
         cluster's sunk pot through the SAME formula the simulator uses
@@ -399,12 +500,11 @@ class KangarooAgent:
                    if clock_date > self.leg_extras[l.option_symbol]["expiry"]]
         if not expired:
             return
-        held = [p for p in self.cli.positions()
-                if p["symbol"] == self.underlying]
+        held = positions.get(self.underlying)
         if held:
-            log(f"{len(expired)} expired leg(s) pending, but the account "
-                f"holds {held[0]['qty']} {self.underlying} from an "
-                f"assignment - settlement deferred until flat")
+            self.say(f"{len(expired)} expired leg(s) pending, but the account "
+                     f"holds {held['qty']} {self.underlying} from an "
+                     f"assignment - settlement deferred until flat")
             return
         for leg in expired:
             extra = self.leg_extras[leg.option_symbol]
@@ -414,69 +514,73 @@ class KangarooAgent:
                 leg.entry_premium, leg.qty, close,
                 self.core.contract_multiplier)
             self.core.book_settled(pnl)
-            log(f"EXPIRED leg {leg.option_symbol} x{leg.qty} "
-                f"{'ITM' if itm else 'OTM'} at {self.underlying} "
-                f"{close:.2f} on {extra['expiry']}: {pnl:+.2f} USD booked "
-                f"into cluster {self.core.cluster_id} "
-                f"(pot {self.core.sunk_pot:+.2f})")
+            self.say(f"EXPIRED leg {leg.option_symbol} x{leg.qty} "
+                     f"{'ITM' if itm else 'OTM'} at {self.underlying} "
+                     f"{close:.2f} on {extra['expiry']}: {pnl:+.2f} USD "
+                     f"booked into cluster {self.core.cluster_id} "
+                     f"(pot {self.core.sunk_pot:+.2f})")
             self.core.legs.remove(leg)
         if not self.core.legs:
             ended, booked = self.core.cluster_id, self.core.sunk_pot
             self.core.on_cluster_closed(toggle=False)
-            log(f"cluster {ended} fully expired: {booked:+.2f} USD realized "
-                f"- restarting put grid (cluster {self.core.cluster_id})")
+            self.say(f"cluster {ended} fully expired: {booked:+.2f} USD "
+                     f"realized - restarting put grid "
+                     f"(cluster {self.core.cluster_id})")
         self.save_state()
 
-    def assignment_gate(self) -> None:
+    def assignment_gate(self, positions: dict) -> None:
         """An assigned stock position is flattened immediately (user rule
         from the reference options bot: no wheel, close assignments)."""
-        for p in self.cli.positions():
-            if p["symbol"] != self.underlying:
-                continue
-            signed = float(p["qty"])
-            side = "sell" if signed > 0 else "buy"
-            log(f"ASSIGNMENT GATE: found {signed} {self.underlying} - "
-                f"flattening at market")
-            if self.dry_run:
+        p = positions.get(self.underlying)
+        if p is None:
+            return
+        signed = float(p["qty"])
+        side = "sell" if signed > 0 else "buy"
+        self.say(f"ASSIGNMENT GATE: found {signed} {self.underlying} - "
+                 f"flattening at market")
+        if self.dry_run:
+            return
+        order = self.cli.submit_equity_market(
+            self.underlying, abs(signed), side,
+            f"kang_assign_flat_{self.underlying}")
+        while True:                 # market order: await the fill
+            o = self.cli.order_get(order["id"])
+            if o["status"] == "filled":
+                self.say(f"assignment flattened: {o.get('filled_avg_price')}")
                 return
-            order = self.cli.submit_equity_market(
-                self.underlying, abs(signed), side,
-                f"kang_assign_flat_{p['symbol']}")
-            while True:                 # market order: await the fill
-                o = self.cli.order_get(order["id"])
-                if o["status"] == "filled":
-                    log(f"assignment flattened: {o.get('filled_avg_price')}")
-                    return
-                if o["status"] in TERMINAL_BAD:
-                    raise AlpacaCliError(f"assignment flatten failed: {o}")
-                time.sleep(self.poll_fill_seconds)
+            if o["status"] in TERMINAL_BAD:
+                raise AlpacaCliError(f"assignment flatten failed: {o}")
+            time.sleep(self.poll_fill_seconds)
 
-    # --- main loop -------------------------------------------------------
+    # --- one decision pass ------------------------------------------------
 
-    def step(self) -> None:
-        clock = self.cli.clock()
+    def step(self, clock: dict, positions: dict) -> None:
+        """One decision pass. `clock` and `positions` are read ONCE per poll
+        by the loader and shared, so N instruments cost one clock call and
+        one positions call, not N of each."""
         # Assignment BEFORE settlement: an assigned short put leaves stock
         # in the account, and handle_expiries must not book an intrinsic
         # settlement while that position is open. Flattening needs an open
         # market; handle_expiries defers over the hours in between.
         if clock["is_open"]:
-            self.assignment_gate()
-        self.handle_expiries(clock["timestamp"][:10])
+            self.assignment_gate(positions)
+        self.handle_expiries(clock["timestamp"][:10], positions)
         if not clock["is_open"]:
             if self._market_was_open is not False:
-                log(f"market closed - next open {clock['next_open']} "
-                    f"(clock {clock['timestamp']})")
+                self.say(f"market closed - next open {clock['next_open']} "
+                         f"(clock {clock['timestamp']})")
                 self._market_was_open = False
             return
         if self._market_was_open is not True:
-            log(f"market open - next close {clock['next_close']} "
-                f"(clock {clock['timestamp']})")
+            self.say(f"market open - next close {clock['next_close']} "
+                     f"(clock {clock['timestamp']})")
             self._market_was_open = True
 
         quote = self.cli.stock_quote(self.underlying)
         spot_bid, spot_ask, quote_ts = quote["bp"], quote["ap"], quote["t"]
         if not (spot_bid > 0 and spot_ask > 0):
-            raise AlpacaCliError(f"invalid underlying quote: {quote}")
+            raise AlpacaCliError(
+                f"invalid {self.underlying} quote: {quote}")
 
         if self.core.legs:
             pnl, costs, opt_ts = self.closeable_pnl()
@@ -486,24 +590,55 @@ class KangarooAgent:
 
         qty = self.core.check_rebuy(spot_bid, spot_ask)
         if qty:
-            self.open_leg(qty, spot_bid, spot_ask)
+            self.open_leg(qty, spot_bid, spot_ask,
+                          date.fromisoformat(clock["timestamp"][:10]))
+
+
+class KangarooAgent:
+    """The loader: one CLI, one clock, one account, N instruments."""
+
+    def __init__(self, config: dict, dry_run: bool,
+                 config_path: str) -> None:
+        self.cfg = config
+        self.dry_run = dry_run
+        self.poll_seconds = float(config["poll_seconds"])
+        self.cli = AlpacaCli(config["cli_path"], config.get("env_file"))
+        config_dir = os.path.dirname(os.path.abspath(config_path))
+        self.instruments = [
+            Instrument(c, self.cli, dry_run, config_dir)
+            for c in load_instrument_configs(config, config_dir)
+        ]
+
+    def positions_by_symbol(self) -> dict:
+        return {p["symbol"]: p for p in self.cli.positions()}
 
     def run(self, once: bool) -> None:
         account = self.cli.account()
         log(f"account {account['account_number']} "
+            f"equity={account['equity']} "
             f"options_approved_level={account['options_approved_level']} "
             f"options_trading_level={account['options_trading_level']}")
-        self.load_state()
-        # Settle first, THEN reconcile: an expired leg is gone from the
-        # account, so reconcile would reject the state file it just read
-        # and the agent could never restart after a settlement failure.
-        self.handle_expiries(self.cli.clock()["timestamp"][:10])
-        self.reconcile()
-        log(f"agent start: put-credit-spread grid on {self.underlying}, "
-            f"cluster {self.core.cluster_id}, legs={self.core.invest_count}, "
+        clock = self.cli.clock()
+        positions = self.positions_by_symbol()
+        for inst in self.instruments:
+            inst.load_state()
+            # Settle first, THEN reconcile: an expired leg is gone from the
+            # account, so reconcile would reject the state file it just read
+            # and the agent could never restart after a settlement failure.
+            inst.handle_expiries(clock["timestamp"][:10], positions)
+            inst.reconcile(positions)
+            log(f"grid ready: cluster {inst.core.cluster_id}, "
+                f"legs={inst.core.invest_count}, "
+                f"state={os.path.basename(inst.state_file)}",
+                who=inst.underlying)
+        log(f"agent start: {len(self.instruments)} instrument(s) "
+            f"[{', '.join(i.underlying for i in self.instruments)}], "
             f"dry_run={self.dry_run}")
         while True:
-            self.step()
+            clock = self.cli.clock()
+            positions = self.positions_by_symbol()
+            for inst in self.instruments:
+                inst.step(clock, positions)
             if once:
                 return
             time.sleep(self.poll_seconds)
@@ -521,7 +656,8 @@ def main() -> int:
     with open(args.config, "r", encoding="utf-8") as fh:
         config = yaml.safe_load(fh)
 
-    agent = KangarooAgent(config, dry_run=args.dry_run)
+    agent = KangarooAgent(config, dry_run=args.dry_run,
+                          config_path=args.config)
     agent.run(once=args.once)
     return 0
 

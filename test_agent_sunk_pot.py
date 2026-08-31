@@ -34,7 +34,7 @@ import sys
 import tempfile
 
 import agent as agent_mod
-from agent import KangarooAgent
+from agent import Instrument, load_instrument_configs
 from kangaroo_core import settlement_pnl
 
 SETTLE_CLOSE = 767.00      # underlying close of the expiry day
@@ -76,23 +76,8 @@ def make_agent(cli, *, legs, sunk_pot=0.0):
         "state_file": os.path.join(state_dir, "state.json"),
         "cli_path": "unused", "env_file": None,
     }
-    a = KangarooAgent.__new__(KangarooAgent)      # no broker construction
-    a.dry_run = False
-    a.underlying = cfg["underlying"]
-    a.dte_min, a.dte_max = cfg["dte_min"], cfg["dte_max"]
-    a.spread_widths = cfg["spread_widths"]
-    a.poll_seconds = cfg["poll_seconds"]
-    a.poll_fill_seconds = cfg["poll_fill_seconds"]
-    a.fill_requote_samples = cfg["fill_requote_samples"]
-    a.state_file = cfg["state_file"]
-    a.cli = cli
-    a._market_was_open = None
-    from kangaroo_core import KangarooCore
-    a.core = KangarooCore(rebuy_1st_pct=cfg["rebuy_1st_pct"],
-                          rebuy_pct=cfg["rebuy_pct"], tp_pct=cfg["tp_pct"],
-                          initial_qty=cfg["initial_qty"],
-                          max_invest_count=cfg["max_invest_count"],
-                          start_long=True)
+    cfg["max_adverse_pct"] = 0.0
+    a = Instrument(cfg, cli, dry_run=False, config_dir=state_dir)
     a.core.sunk_pot = sunk_pot
     a.leg_extras = {}
     for occ, qty, credit, strike, wing, expiry in legs:
@@ -108,12 +93,86 @@ def patch_settlement(monkey_close=SETTLE_CLOSE):
         [{"c": monkey_close, "t": start}] if monkey_close else [])
 
 
+def test_loader_without_config_path_yields_one_instrument():
+    loader = {"underlying": "SPY", "config_path": "_", "tp_pct": 0.10}
+    got = load_instrument_configs(loader, ".")
+    assert len(got) == 1 and got[0]["underlying"] == "SPY", got
+
+
+def test_loader_reads_one_config_per_instrument_and_inherits():
+    folder = tempfile.mkdtemp(prefix="kang_cfgs_")
+    with open(os.path.join(folder, "spy.yaml"), "w", encoding="utf-8") as fh:
+        fh.write("underlying: SPY\ntp_pct: 0.04\n")
+    with open(os.path.join(folder, "qqq.yaml"), "w", encoding="utf-8") as fh:
+        fh.write("underlying: QQQ\n")
+    loader = {"underlying": "IGNORED", "tp_pct": 0.10, "dte_min": 4,
+              "config_path": folder}
+    got = load_instrument_configs(loader, ".")
+    by = {c["underlying"]: c for c in got}
+    assert set(by) == {"SPY", "QQQ"}, by
+    assert by["SPY"]["tp_pct"] == 0.04, "own value wins"
+    assert by["QQQ"]["tp_pct"] == 0.10, "loader value is inherited"
+    assert by["QQQ"]["dte_min"] == 4, "loader value is inherited"
+
+
+def test_loader_refuses_a_duplicate_underlying():
+    folder = tempfile.mkdtemp(prefix="kang_dup_")
+    for name in ("a.yaml", "b.yaml"):
+        with open(os.path.join(folder, name), "w", encoding="utf-8") as fh:
+            fh.write("underlying: SPY\n")
+    try:
+        load_instrument_configs({"config_path": folder}, ".")
+    except agent_mod.AlpacaCliError as exc:
+        assert "same underlying" in str(exc), exc
+    else:
+        raise AssertionError("two grids on one symbol must fail loud")
+
+
+def test_instrument_config_may_not_override_process_keys():
+    folder = tempfile.mkdtemp(prefix="kang_proc_")
+    with open(os.path.join(folder, "spy.yaml"), "w", encoding="utf-8") as fh:
+        fh.write("underlying: SPY\ncli_path: /somewhere/else\n")
+    try:
+        load_instrument_configs({"config_path": folder}, ".")
+    except agent_mod.AlpacaCliError as exc:
+        assert "loader-only" in str(exc), exc
+    else:
+        raise AssertionError("a per-instrument config must not move the CLI")
+
+
+def test_state_file_is_absolute_and_per_symbol():
+    d = tempfile.mkdtemp(prefix="kang_state_")
+    cfg = {"underlying": "QQQ", "rebuy_1st_pct": 1.2, "rebuy_pct": 0.10,
+           "tp_pct": 0.10, "initial_qty": 1, "max_invest_count": 20,
+           "max_adverse_pct": 0.0, "dte_min": 4, "dte_max": 10,
+           "spread_widths": [5], "poll_fill_seconds": 2,
+           "fill_requote_samples": 30}
+    inst = Instrument(cfg, None, dry_run=True, config_dir=d)
+    assert os.path.isabs(inst.state_file), inst.state_file
+    assert "qqq" in os.path.basename(inst.state_file), inst.state_file
+    other = Instrument(dict(cfg, underlying="SPY"), None, True, d)
+    assert inst.state_file != other.state_file
+
+
+def test_client_order_id_carries_the_instrument():
+    cfg = {"underlying": "AMD", "rebuy_1st_pct": 1.2, "rebuy_pct": 0.10,
+           "tp_pct": 0.10, "initial_qty": 1, "max_invest_count": 20,
+           "max_adverse_pct": 0.0, "dte_min": 4, "dte_max": 10,
+           "spread_widths": [5], "poll_fill_seconds": 2,
+           "fill_requote_samples": 30}
+    a = Instrument(cfg, None, True, tempfile.mkdtemp())
+    b = Instrument(dict(cfg, underlying="MSFT"), None, True,
+                   tempfile.mkdtemp())
+    assert a.coid("o", 0) != b.coid("o", 0), "ids would collide in one account"
+    assert "AMD" in a.coid("o", 0) and "MSFT" in b.coid("o", 0)
+
+
 def test_expired_leg_reaches_the_pot():
     patch_settlement()
     cli = StubCli(is_open=False, timestamp="2026-09-05T00:00:03-04:00")
     a = make_agent(cli, legs=[("SPY260904P00770000", 2, 1.20,
                                770.0, 765.0, "2026-09-04")])
-    a.handle_expiries("2026-09-05")
+    a.handle_expiries("2026-09-05", {p['symbol']: p for p in cli.positions()})
     expected, itm = settlement_pnl("put_spread", "put", 770.0, 765.0,
                                    1.20, 2, SETTLE_CLOSE, 100)
     assert itm is True, "770 short put against a 767 close is ITM"
@@ -133,7 +192,7 @@ def test_pot_survives_while_other_legs_stay_open():
         ("SPY260904P00770000", 2, 1.20, 770.0, 765.0, "2026-09-04"),
         ("SPY260911P00760000", 1, 1.00, 760.0, 755.0, "2026-09-11"),
     ])
-    a.handle_expiries("2026-09-05")
+    a.handle_expiries("2026-09-05", {p['symbol']: p for p in cli.positions()})
     expected, _ = settlement_pnl("put_spread", "put", 770.0, 765.0,
                                  1.20, 2, SETTLE_CLOSE, 100)
     assert len(a.core.legs) == 1, a.core.legs
@@ -150,7 +209,7 @@ def test_settlement_is_deferred_while_an_assignment_is_open():
                   positions=[{"symbol": "SPY", "qty": "200", "side": "long"}])
     a = make_agent(cli, legs=[("SPY260904P00770000", 2, 1.20,
                                770.0, 765.0, "2026-09-04")])
-    a.handle_expiries("2026-09-05")
+    a.handle_expiries("2026-09-05", {p['symbol']: p for p in cli.positions()})
     assert len(a.core.legs) == 1, "the leg must stay until the stock is flat"
     assert a.core.sunk_pot == 0.0, "nothing may be booked twice"
 
@@ -161,7 +220,7 @@ def test_missing_settlement_bar_fails_loud():
     a = make_agent(cli, legs=[("SPY260904P00770000", 2, 1.20,
                                770.0, 765.0, "2026-09-04")])
     try:
-        a.handle_expiries("2026-09-05")
+        a.handle_expiries("2026-09-05", {p['symbol']: p for p in cli.positions()})
     except agent_mod.AlpacaCliError as exc:
         assert "cannot settle" in str(exc), exc
     else:
@@ -178,12 +237,12 @@ def test_assignment_gate_runs_before_the_settlement():
     a = make_agent(cli, legs=[("SPY260904P00770000", 2, 1.20,
                                770.0, 765.0, "2026-09-04")])
     seen = []
-    a.assignment_gate = lambda: seen.append("assignment")
+    a.assignment_gate = lambda pos: seen.append("assignment")
     orig = a.handle_expiries
-    a.handle_expiries = lambda d: (seen.append("expiries"), orig(d))[1]
+    a.handle_expiries = lambda d, pos: (seen.append("expiries"), orig(d, pos))[1]
     a.stock_quote_called = False
     try:
-        a.step()
+        a.step(cli.clock(), {p['symbol']: p for p in cli.positions()})
     except Exception:
         pass          # the stub has no quotes; the order is what we check
     assert seen[:2] == ["assignment", "expiries"], seen
