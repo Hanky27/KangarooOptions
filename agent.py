@@ -395,12 +395,23 @@ class Instrument:
     # --- order helpers ---------------------------------------------------
 
     def coid(self, kind: str, leg_index: int) -> str:
-        """Client order id. Carries the INSTRUMENT, symbol AND direction:
-        instruments reach the same cluster and leg counter independently,
-        so without it a long and a short grid on one symbol collide on the
-        same id inside one account."""
+        """Client order id, UNIQUE PER SUBMISSION.
+
+        Carries the INSTRUMENT, symbol AND direction: instruments reach the
+        same cluster and leg counter independently, so without that a long
+        and a short grid on one symbol collide on the same id in one
+        account.
+
+        The millisecond stamp is what makes it unique per ATTEMPT, and that
+        is not cosmetic: an unfilled limit order is canceled by id after
+        fill_requote_samples polls and re-quoted on the next loop. Re-using
+        the id there is rejected by the broker - measured live 2026-08-31,
+        HTTP 422 code 40010001 "client_order_id must be unique" - and the
+        instrument then fails EVERY poll, walking towards its halt while
+        the grid never opens. A per-process counter would collide again
+        after a restart; a timestamp does not."""
         return (f"kang_{self.name}_c{self.core.cluster_id}"
-                f"_l{leg_index}_{kind}")
+                f"_l{leg_index}_{kind}_{int(time.time() * 1000)}")
 
     def wait_filled_or_cancel(self, order_id: str) -> dict | None:
         """Poll one order until filled. After fill_requote_samples polls the
