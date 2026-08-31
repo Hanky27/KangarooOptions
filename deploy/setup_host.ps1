@@ -153,6 +153,18 @@ if ($needed) {
    Ok "unpacked -> $cliExe ($(& $cliExe version -q 2>&1))"
 }
 
+# --- 3b. Python dependencies --------------------------------------------
+# PyYAML is the ONLY third-party import in the agent's chain (agent.py,
+# alpaca_cli.py, kangaroo_core.py - the rest is stdlib or this repo).
+Step 'Python dependencies'
+$req = Join-Path $repoDir 'requirements.txt'
+if (Test-Path $req) {
+   $pipOut = & $py -m pip install --quiet --disable-pip-version-check -r $req 2>&1
+   if ($LASTEXITCODE -ne 0) { throw ("pip failed:`n" + ($pipOut -join "`n")) }
+   Ok ((& $py -c "import yaml;print('PyYAML ' + yaml.__version__)") 2>&1)
+}
+else { Bad "no requirements.txt in the checkout" }
+
 # --- 4. config.yaml for THIS host ---------------------------------------
 Step 'config.yaml (generated - it names local paths, so it is not in the repo)'
 $cfgPath = Join-Path $repoDir 'config.yaml'

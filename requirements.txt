@@ -1,0 +1,7 @@
+# Runtime dependencies of the agent and the research tools.
+#
+# Everything else the bot imports is either the standard library or a module
+# of this repo - verified 2026-08-31 by listing every import of agent.py,
+# alpaca_cli.py and kangaroo_core.py. Pinned, because a host that drifts to
+# another release no longer matches what was measured here.
+PyYAML==6.0.3
