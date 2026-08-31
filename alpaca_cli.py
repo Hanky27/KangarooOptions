@@ -110,6 +110,15 @@ class AlpacaCli:
         body = self._run(["data", "latest-quote", "--symbol", symbol])
         return body["quote"]
 
+    def stock_quotes(self, symbols: list[str]) -> dict[str, dict]:
+        """Latest NBBO quotes for several underlyings in ONE request:
+        {symbol: {'ap','bp','t',...}}. The single-symbol endpoint costs one
+        request per symbol, which makes the poll rate scale with the number
+        of instruments; this one does not."""
+        body = self._run(["data", "latest-quotes",
+                          "--symbols", ",".join(symbols)])
+        return body["quotes"]
+
     def option_quotes(self, symbols: list[str]) -> dict[str, dict]:
         """Latest quotes for OCC option symbols: {symbol: {'ap','bp','t',...}}."""
         body = self._run(["data", "option", "latest-quotes",

@@ -95,6 +95,7 @@ import json
 import os
 import sys
 import time
+import traceback
 from datetime import date, timedelta
 
 import yaml
@@ -110,6 +111,13 @@ TERMINAL_BAD = {"canceled", "expired", "rejected", "done_for_day",
 # not override them because they describe the PROCESS, not the grid.
 PROCESS_KEYS = ("cli_path", "env_file", "poll_seconds", "poll_fill_seconds",
                 "fill_requote_samples", "config_path")
+
+
+# Consecutive failed polls before an instrument is halted for the rest of
+# the run. One transient failure (a quote gap, a throttle) must not stop a
+# grid that holds positions; a persistent one must not keep retrying an
+# order every few seconds for days.
+HALT_AFTER = 20
 
 
 def log(message: str, data_ts: str | None = None,
@@ -241,6 +249,10 @@ class Instrument:
         # per-leg spread details, keyed by the SHORT leg's OCC symbol
         self.leg_extras: dict[str, dict] = {}
         self._market_was_open: bool | None = None
+        # Consecutive failed polls. Reset by the first clean one; at
+        # HALT_AFTER the instrument stops for the rest of the run.
+        self.failures = 0
+        self.halted = False
 
     def say(self, message: str, data_ts: str | None = None) -> None:
         log(message, data_ts, who=self.name)
@@ -443,14 +455,20 @@ class Instrument:
                  f"credit {net_credit:.2f} (underlying "
                  f"{self.core.legs[-1].entry_underlying})", spread["quote_ts"])
 
-    def closeable_pnl(self) -> tuple[float, dict, str]:
-        """(cluster P&L closeable NOW, per-leg net close costs, quote ts).
-        Close cost per spread = short ask - wing bid."""
-        symbols = []
+    def leg_symbols(self) -> list[str]:
+        """Every OCC symbol this instrument currently holds, short legs and
+        wings. The loader collects these across instruments to ask for all
+        option quotes in one request."""
+        out = []
         for leg in self.core.legs:
-            symbols += [leg.option_symbol,
-                        self.leg_extras[leg.option_symbol]["wing_occ"]]
-        quotes = self.cli.option_quotes(symbols)
+            out += [leg.option_symbol,
+                    self.leg_extras[leg.option_symbol]["wing_occ"]]
+        return out
+
+    def closeable_pnl(self, quotes: dict) -> tuple[float, dict, str]:
+        """(cluster P&L closeable NOW, per-leg net close costs, quote ts).
+        Close cost per spread = short ask - wing bid. `quotes` is the
+        loader's shared option-quote map, so this costs no request."""
         total, costs, ts = 0.0, {}, None
         for leg in self.core.legs:
             occ_w = self.leg_extras[leg.option_symbol]["wing_occ"]
@@ -601,10 +619,11 @@ class Instrument:
 
     # --- one decision pass ------------------------------------------------
 
-    def step(self, clock: dict, positions: dict) -> None:
-        """One decision pass. `clock` and `positions` are read ONCE per poll
-        by the loader and shared, so N instruments cost one clock call and
-        one positions call, not N of each."""
+    def step(self, clock: dict, positions: dict, stock_quotes: dict,
+             option_quotes: dict) -> None:
+        """One decision pass. The clock, the position list and BOTH quote
+        maps are read ONCE per poll by the loader and shared, so a poll
+        costs four requests no matter how many instruments there are."""
         # Assignment BEFORE settlement: an assigned short put leaves stock
         # in the account, and handle_expiries must not book an intrinsic
         # settlement while that position is open. Flattening needs an open
@@ -623,14 +642,18 @@ class Instrument:
                      f"(clock {clock['timestamp']})")
             self._market_was_open = True
 
-        quote = self.cli.stock_quote(self.underlying)
+        quote = stock_quotes.get(self.underlying)
+        if quote is None:
+            raise AlpacaCliError(
+                f"no quote for {self.underlying} in the batch "
+                f"{sorted(stock_quotes)}")
         spot_bid, spot_ask, quote_ts = quote["bp"], quote["ap"], quote["t"]
         if not (spot_bid > 0 and spot_ask > 0):
             raise AlpacaCliError(
                 f"invalid {self.underlying} quote: {quote}")
 
         if self.core.legs:
-            pnl, costs, opt_ts = self.closeable_pnl()
+            pnl, costs, opt_ts = self.closeable_pnl(option_quotes)
             if self.core.check_close(pnl, spot_bid, spot_ask):
                 self.close_cluster(costs, opt_ts)
                 return  # never open in the same iteration as a close
@@ -650,6 +673,7 @@ class KangarooAgent:
         self.dry_run = dry_run
         self.poll_seconds = float(config["poll_seconds"])
         self.cli = AlpacaCli(config["cli_path"], config.get("env_file"))
+        self._reported_halted: list[str] = []
         config_dir = os.path.dirname(os.path.abspath(config_path))
         self.instruments = [
             Instrument(c, self.cli, dry_run, config_dir)
@@ -658,6 +682,16 @@ class KangarooAgent:
 
     def positions_by_symbol(self) -> dict:
         return {p["symbol"]: p for p in self.cli.positions()}
+
+    def market_data(self) -> tuple[dict, dict]:
+        """(stock quotes, option quotes) for every instrument, in at most
+        two requests. The option call is skipped entirely while no
+        instrument holds a leg."""
+        underlyings = sorted({i.underlying for i in self.instruments})
+        stock = self.cli.stock_quotes(underlyings)
+        occs = sorted({o for i in self.instruments for o in i.leg_symbols()})
+        options = self.cli.option_quotes(occs) if occs else {}
+        return stock, options
 
     def run(self, once: bool) -> None:
         account = self.cli.account()
@@ -668,24 +702,70 @@ class KangarooAgent:
         clock = self.cli.clock()
         positions = self.positions_by_symbol()
         for inst in self.instruments:
-            inst.load_state()
-            # Settle first, THEN reconcile: an expired leg is gone from the
-            # account, so reconcile would reject the state file it just read
-            # and the agent could never restart after a settlement failure.
-            inst.handle_expiries(clock["timestamp"][:10], positions)
-            inst.reconcile(positions)
+            # Startup is where a RESTART fails: a state file that no longer
+            # matches the account stops the instrument it belongs to, not
+            # the other 24 - those may hold open positions that need
+            # managing right now. Same rule as the poll loop: the
+            # instrument stops, loudly, and is named in the summary.
+            try:
+                inst.load_state()
+                # Settle first, THEN reconcile: an expired leg is gone from
+                # the account, so reconcile would reject the state file it
+                # just read and the agent could never restart after a
+                # settlement failure.
+                inst.handle_expiries(clock["timestamp"][:10], positions)
+                inst.reconcile(positions)
+            except Exception:                                # noqa: BLE001
+                inst.halted = True
+                inst.say(f"HALTED AT STARTUP - it will not trade in this "
+                         f"run; its positions and state file are untouched "
+                         f"and need a human:\n{traceback.format_exc()}")
+                continue
             log(f"grid ready: cluster {inst.core.cluster_id}, "
                 f"legs={inst.core.invest_count}, "
                 f"state={os.path.basename(inst.state_file)}",
                 who=inst.name)
-        log(f"agent start: {len(self.instruments)} instrument(s) "
-            f"[{', '.join(i.name for i in self.instruments)}], "
-            f"dry_run={self.dry_run}")
+        live = [i.name for i in self.instruments if not i.halted]
+        dead = [i.name for i in self.instruments if i.halted]
+        log(f"agent start: {len(live)} of {len(self.instruments)} "
+            f"instrument(s) live [{', '.join(live)}], dry_run="
+            f"{self.dry_run}")
+        if dead:
+            log(f"{len(dead)} instrument(s) HALTED AT STARTUP: "
+                f"{', '.join(dead)}")
+            self._reported_halted = list(dead)
         while True:
             clock = self.cli.clock()
             positions = self.positions_by_symbol()
+            # Quotes are only worth a request while the market is open;
+            # outside it every instrument returns before it looks at one.
+            if clock["is_open"]:
+                stock_quotes, option_quotes = self.market_data()
+            else:
+                stock_quotes, option_quotes = {}, {}
             for inst in self.instruments:
-                inst.step(clock, positions)
+                if inst.halted:
+                    continue
+                try:
+                    inst.step(clock, positions, stock_quotes, option_quotes)
+                except Exception:                            # noqa: BLE001
+                    inst.failures += 1
+                    inst.say(f"POLL FAILED ({inst.failures}/{HALT_AFTER}) - "
+                             f"this instrument did nothing this poll:\n"
+                             f"{traceback.format_exc()}")
+                    if inst.failures >= HALT_AFTER:
+                        inst.halted = True
+                        inst.say(f"HALTED after {HALT_AFTER} consecutive "
+                                 f"failed polls. It will not trade again in "
+                                 f"this run; its positions and state file "
+                                 f"are untouched and need a human.")
+                else:
+                    inst.failures = 0
+            halted = [i.name for i in self.instruments if i.halted]
+            if halted and halted != self._reported_halted:
+                log(f"{len(halted)} of {len(self.instruments)} instruments "
+                    f"HALTED: {', '.join(halted)}")
+                self._reported_halted = list(halted)
             if once:
                 return
             time.sleep(self.poll_seconds)

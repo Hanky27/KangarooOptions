@@ -28,9 +28,14 @@ instrument, each carrying only what differs from the loader.
 Selection, per symbol and side, over the candidates in
 data/week_<sym>.json:
 
-  ADMITTED only if   net > 0            - a losing side is not traded at
-                                          all, no matter how many wins it
-                                          collected on the way down
+  ADMITTED only if   net + open > 0     - the MARK-TO-MARKET total, not
+                                          the realized one. A grid that
+                                          banks its winners and still holds
+                                          an underwater cluster when the
+                                          window stops has not earned what
+                                          its realized line shows; measured
+                                          on AMZN 2026-08-31, +858 realized
+                                          against -678 still open.
                      wins >= MIN_WINS   - one lucky close is not an edge
   RANKED by          wins_per_week      - the stated objective
   TIE-BROKEN by      net
@@ -72,7 +77,8 @@ def candidates(symbol: str) -> list[dict]:
 def pick(rows: list[dict], side: str) -> dict | None:
     """Best admitted candidate of one side, or None if none qualifies."""
     ok = [r for r in rows
-          if r["side"] == side and r["net"] > 0 and r["wins"] >= MIN_WINS]
+          if r["side"] == side and r["net"] + r["open_at_end"] > 0
+          and r["wins"] >= MIN_WINS]
     if not ok:
         return None
     ok.sort(key=lambda r: (-r["wins_per_week"], -r["net"]))
@@ -89,7 +95,9 @@ def write_config(row: dict, window: str) -> str:
         f"# Window {window}, hourly RTH bars, real option chain.",
         f"#   wins/week {row['wins_per_week']}  trades/week "
         f"{row['trades_per_week']}  win rate {row['win_rate']}",
-        f"#   net {row['net']:+.0f} USD   worst cluster {row['worst']:+.0f}"
+        f"#   net {row['net']:+.0f} USD realized, "
+        f"{row['net'] + row['open_at_end']:+.0f} USD mark to market",
+        f"#   worst cluster {row['worst']:+.0f}"
         f"   equity dd {row['dd']:+.0f}",
         f"#   open at window end {row['open_at_end']:+.0f} USD"
         f"   peak bound margin {row['margin']:.0f} USD",
@@ -136,7 +144,8 @@ def main() -> int:
             best = pick(rows, side)
             if best is None:
                 print(f"{sym:6s} {trend:>7} {side:>5}   -- not admitted "
-                      f"(no candidate with net > 0 and >= {MIN_WINS} wins)")
+                      f"(no candidate with net + open > 0 and "
+                      f">= {MIN_WINS} wins)")
                 continue
             out = "" if dry else write_config(best, window)
             total_margin += best["margin"]
@@ -147,8 +156,10 @@ def main() -> int:
                   f"{best['margin']:>8.0f}  {os.path.basename(out)}")
     wins = sum(r["wins_per_week"] for r in written)
     net = sum(r["net"] for r in written)
+    mtm = sum(r["net"] + r["open_at_end"] for r in written)
     print(f"\n{len(written)} instruments admitted: {wins:.1f} winning "
-          f"clusters per week, {net:+.0f} USD net over the window")
+          f"clusters per week, {net:+.0f} USD realized / "
+          f"{mtm:+.0f} USD mark to market over the window")
     print(f"peak bound margin, summed over instruments: "
           f"{total_margin:,.0f} USD")
     print("  (a SUM of per-instrument peaks - the true simultaneous "

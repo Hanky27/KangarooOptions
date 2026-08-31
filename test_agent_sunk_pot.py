@@ -62,7 +62,7 @@ class StubCli:
     def account(self):
         self.calls.append("account")
         return {"account_number": "STUB", "options_approved_level": 3,
-                "options_trading_level": 3}
+                "options_trading_level": 3, "equity": 100000}
 
 
 def make_agent(cli, *, legs, sunk_pot=0.0):
@@ -92,6 +92,92 @@ def patch_settlement(monkey_close=SETTLE_CLOSE):
     """Replace the network fetch with a fixed bar."""
     agent_mod.fetch_bars = lambda sym, tf, start, end: (
         [{"c": monkey_close, "t": start}] if monkey_close else [])
+
+
+class _Core:
+    cluster_id, invest_count = 1, 0
+
+
+class StubInstrument:
+    """The instrument protocol the loader actually uses, nothing more."""
+
+    def __init__(self, name, fail_step=False, fail_start=False):
+        self.name, self.underlying = name, name.split("_")[0]
+        self.core, self.state_file = _Core(), f"{name}.json"
+        self.halted, self.failures, self.steps = False, 0, 0
+        self._fail_step, self._fail_start = fail_step, fail_start
+        self.said = []
+
+    def say(self, msg, ts=None):
+        self.said.append(msg)
+
+    def load_state(self):
+        if self._fail_start:
+            raise RuntimeError("state file does not match the account")
+
+    def handle_expiries(self, day, positions):
+        pass
+
+    def reconcile(self, positions):
+        pass
+
+    def leg_symbols(self):
+        return []
+
+    def step(self, *a):
+        if self._fail_step:
+            raise RuntimeError("this instrument is broken")
+        self.steps += 1
+
+
+def _loader_with(instruments, polls):
+    a = agent_mod.KangarooAgent.__new__(agent_mod.KangarooAgent)
+    a.dry_run, a.poll_seconds = True, 0
+    a.instruments, a._reported_halted = instruments, []
+    a.cli = StubCli(is_open=False, timestamp="2026-08-31T10:00:00-04:00")
+    for _ in range(polls):
+        a.run(once=True)
+    return a
+
+
+def test_a_broken_instrument_does_not_stop_a_healthy_one():
+    bad = StubInstrument("BAD_long", fail_step=True)
+    good = StubInstrument("GOOD_long")
+    _loader_with([bad, good], polls=3)
+    assert good.steps == 3, f"healthy instrument stepped {good.steps}/3"
+    assert bad.failures == 3, bad.failures
+    assert not bad.halted, "3 failures is below the halt threshold"
+
+
+def test_a_persistently_broken_instrument_is_halted_and_named():
+    bad = StubInstrument("BAD_long", fail_step=True)
+    good = StubInstrument("GOOD_long")
+    _loader_with([bad, good], polls=agent_mod.HALT_AFTER + 2)
+    assert bad.halted, "it must stop trying after HALT_AFTER polls"
+    assert bad.failures == agent_mod.HALT_AFTER, bad.failures
+    assert good.steps == agent_mod.HALT_AFTER + 2, good.steps
+    assert any("HALTED" in m for m in bad.said), bad.said
+
+
+def test_a_clean_poll_resets_the_failure_count():
+    flaky = StubInstrument("FLAKY_long", fail_step=True)
+    good = StubInstrument("GOOD_long")
+    a = _loader_with([flaky, good], polls=2)
+    assert flaky.failures == 2, flaky.failures
+    flaky._fail_step = False
+    a.run(once=True)
+    assert flaky.failures == 0, "a clean poll must clear the count"
+    assert not flaky.halted
+
+
+def test_a_startup_failure_halts_only_that_instrument():
+    bad = StubInstrument("BAD_long", fail_start=True)
+    good = StubInstrument("GOOD_long")
+    _loader_with([bad, good], polls=2)
+    assert bad.halted, "a bad state file must halt its own instrument"
+    assert bad.steps == 0, "a halted instrument must not trade"
+    assert good.steps == 2, f"healthy instrument stepped {good.steps}/2"
+    assert any("HALTED AT STARTUP" in m for m in bad.said), bad.said
 
 
 def test_loader_without_config_path_yields_one_instrument():
@@ -343,11 +429,14 @@ def test_assignment_gate_runs_before_the_settlement():
     a.assignment_gate = lambda pos: seen.append("assignment")
     orig = a.handle_expiries
     a.handle_expiries = lambda d, pos: (seen.append("expiries"), orig(d, pos))[1]
-    a.stock_quote_called = False
     try:
-        a.step(cli.clock(), {p['symbol']: p for p in cli.positions()})
-    except Exception:
-        pass          # the stub has no quotes; the order is what we check
+        # Empty quote maps: the instrument gets that far and then fails
+        # loud on the missing quote. The ORDER before it is what is tested,
+        # and only that one error is tolerated - a TypeError from a changed
+        # signature must not pass for a missing quote.
+        a.step(cli.clock(), {p['symbol']: p for p in cli.positions()}, {}, {})
+    except agent_mod.AlpacaCliError:
+        pass
     assert seen[:2] == ["assignment", "expiries"], seen
 
 
