@@ -101,6 +101,7 @@ from datetime import date, timedelta
 import yaml
 
 from alpaca_cli import AlpacaCli, AlpacaCliError
+from risk_gate import RiskGate
 from fetch_alpaca_bars import fetch as fetch_bars
 from kangaroo_core import KangarooCore, settlement_pnl
 
@@ -110,7 +111,7 @@ TERMINAL_BAD = {"canceled", "expired", "rejected", "done_for_day",
 # Keys the loader supplies once for the whole run; an instrument config may
 # not override them because they describe the PROCESS, not the grid.
 PROCESS_KEYS = ("cli_path", "env_file", "poll_seconds", "poll_fill_seconds",
-                "fill_requote_samples", "config_path")
+                "fill_requote_samples", "config_path", "risk_gate")
 
 
 # Consecutive failed polls before an instrument is halted for the rest of
@@ -795,8 +796,29 @@ class Instrument:
 
     # --- one decision pass ------------------------------------------------
 
+    def depth(self, spot: float) -> dict:
+        """This cluster in the few numbers a portfolio decision needs.
+
+        Also used to build the portfolio-wide view, so every instrument is
+        described to the model in exactly the same terms as the one being
+        decided about.
+        """
+        anchor = self.core.cluster_anchor
+        adverse = None
+        if anchor:
+            moved = (anchor - spot) if self.core.is_long else (spot - anchor)
+            adverse = round(moved / anchor * 100.0, 3)
+        return {"instrument": self.name,
+                "direction": "long" if self.core.is_long else "short",
+                "legs": len(self.core.legs),
+                "leg_index": self.core.invest_count,
+                "contracts_open": sum(leg.qty for leg in self.core.legs),
+                "adverse_pct_from_anchor": adverse,
+                "max_adverse_pct": self.core.max_adverse_pct or None}
+
     def step(self, clock: dict, positions: dict, stock_quotes: dict,
-             option_quotes: dict) -> None:
+             option_quotes: dict, gate=None, portfolio: dict | None = None
+             ) -> None:
         """One decision pass. The clock, the position list and BOTH quote
         maps are read ONCE per poll by the loader and shared, so a poll
         costs four requests no matter how many instruments there are."""
@@ -835,6 +857,22 @@ class Instrument:
                 return  # never open in the same iteration as a close
 
         qty = self.core.check_rebuy(spot_bid, spot_ask)
+        if qty and gate is not None:
+            spot = (spot_bid + spot_ask) / 2.0
+            view = dict(portfolio or {})
+            view["this_cluster"] = self.depth(spot)
+            view["spot"] = round(spot, 4)
+            view["leg_index"] = self.core.invest_count
+            decision = gate.review(qty, view)
+            # Logged whenever a model was actually involved, not only when
+            # it changed something: "the gate agreed" and "the gate was
+            # down" must be distinguishable afterwards.
+            if decision.source != "passthrough":
+                self.say(f"RISK GATE [{decision.source}] "
+                         f"{decision.requested} -> {decision.allowed} "
+                         f"({decision.latency_ms} ms): {decision.reason}",
+                         quote_ts)
+            qty = decision.allowed
         if qty:
             self.open_leg(qty, spot_bid, spot_ask,
                           date.fromisoformat(clock["timestamp"][:10]),
@@ -850,6 +888,7 @@ class KangarooAgent:
         self.dry_run = dry_run
         self.poll_seconds = float(config["poll_seconds"])
         self.cli = AlpacaCli(config["cli_path"], config.get("env_file"))
+        self.gate = RiskGate(config.get("risk_gate") or {}, say=log)
         self._reported_halted: list[str] = []
         config_dir = os.path.dirname(os.path.abspath(config_path))
         self.instruments = [
@@ -859,6 +898,36 @@ class KangarooAgent:
 
     def positions_by_symbol(self) -> dict:
         return {p["symbol"]: p for p in self.cli.positions()}
+
+    def portfolio_view(self, account: dict, stock_quotes: dict) -> dict:
+        """The whole account in the terms the gate reasons about.
+
+        Built once per poll and shared by every instrument, so the model
+        sees one consistent picture rather than 25 slightly different ones.
+        `headroom_pct` is options buying power as a percentage of equity -
+        what is left to open with, against what is at stake.
+        """
+        equity = float(account["equity"])
+        obp = float(account.get("options_buying_power") or 0.0)
+        rows = []
+        for inst in self.instruments:
+            quote = stock_quotes.get(inst.underlying) or {}
+            bid, ask = quote.get("bp"), quote.get("ap")
+            spot = (bid + ask) / 2.0 if bid and ask else 0.0
+            if inst.core.legs:
+                rows.append(inst.depth(spot))
+        return {
+            "equity": round(equity, 2),
+            "cash": round(float(account["cash"]), 2),
+            "options_buying_power": round(obp, 2),
+            "maintenance_margin": round(
+                float(account.get("maintenance_margin") or 0.0), 2),
+            "headroom_pct": round(obp / equity * 100.0, 1) if equity else None,
+            "clusters_open": len(rows),
+            "instruments_total": len(self.instruments),
+            "open_clusters": sorted(
+                rows, key=lambda r: -(r["adverse_pct_from_anchor"] or 0.0)),
+        }
 
     def market_data(self) -> tuple[dict, dict]:
         """(stock quotes, option quotes) for every instrument, in at most
@@ -914,6 +983,15 @@ class KangarooAgent:
                 who=inst.name)
         live = [i.name for i in self.instruments if not i.halted]
         dead = [i.name for i in self.instruments if i.halted]
+        c = self.gate.counters()
+        if c["enabled"]:
+            log(f"risk gate: {c['provider']} {c['model']}, consulted from "
+                f"leg {self.gate.consult_from_leg} or below "
+                f"{self.gate.headroom_pct}% headroom, key from "
+                f"{self.gate.key_env}"
+                f"{' - NOT SET' if not os.environ.get(self.gate.key_env) else ''}")
+        else:
+            log("risk gate: disabled - the grid decides its own size")
         log(f"agent start: {len(live)} of {len(self.instruments)} "
             f"instrument(s) live [{', '.join(live)}], dry_run="
             f"{self.dry_run}")
@@ -930,11 +1008,19 @@ class KangarooAgent:
                 stock_quotes, option_quotes = self.market_data()
             else:
                 stock_quotes, option_quotes = {}, {}
+            # One extra request per poll, and only while the gate is on and
+            # the market is open: margin is what the gate reasons about and
+            # it is not in the position list.
+            portfolio = None
+            if self.gate.enabled and clock["is_open"]:
+                portfolio = self.portfolio_view(self.cli.account(),
+                                                stock_quotes)
             for inst in self.instruments:
                 if inst.halted:
                     continue
                 try:
-                    inst.step(clock, positions, stock_quotes, option_quotes)
+                    inst.step(clock, positions, stock_quotes, option_quotes,
+                              gate=self.gate, portfolio=portfolio)
                 except Exception:                            # noqa: BLE001
                     inst.failures += 1
                     inst.say(f"POLL FAILED ({inst.failures}/{HALT_AFTER}) - "

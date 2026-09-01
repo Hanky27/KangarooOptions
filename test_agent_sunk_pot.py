@@ -35,6 +35,7 @@ import tempfile
 from datetime import date
 
 import agent as agent_mod
+import risk_gate
 from agent import (Instrument, SingleInstance,
                    load_instrument_configs)
 from kangaroo_core import settlement_pnl
@@ -134,7 +135,11 @@ class StubInstrument:
     def leg_symbols(self):
         return []
 
-    def step(self, *a):
+    def step(self, *a, **kw):
+        # The loader hands every instrument the gate and the portfolio
+        # view as keywords; a stub that refuses them would fail for a
+        # reason that has nothing to do with what these tests measure.
+        self.gate_seen = kw.get("gate")
         if self._fail_step:
             raise RuntimeError("this instrument is broken")
         self.steps += 1
@@ -144,6 +149,9 @@ def _loader_with(instruments, polls):
     a = agent_mod.KangarooAgent.__new__(agent_mod.KangarooAgent)
     a.dry_run, a.poll_seconds = True, 0
     a.instruments, a._reported_halted = instruments, []
+    # A loader always has a gate; disabled is the default and costs nothing,
+    # so these tests exercise the same code path as a run without a key.
+    a.gate = risk_gate.RiskGate({}, say=lambda *_a, **_k: None)
     a.cli = StubCli(is_open=False, timestamp="2026-08-31T10:00:00-04:00")
     for _ in range(polls):
         a.run(once=True)
