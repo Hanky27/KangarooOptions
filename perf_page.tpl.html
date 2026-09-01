@@ -822,7 +822,10 @@ Do not edit docs/index.html - it is the output, this file is the source.
       // One scale for both series - a second y-axis would let two lines
       // that are far apart look like they touch.
       var values = [D.start_equity];
-      pts.forEach(function (p) { values.push(p.equity, p.balance); });
+      pts.forEach(function (p) {
+        if (p.equity !== null && p.equity !== undefined) values.push(p.equity);
+        values.push(p.balance);
+      });
       var lo = Math.min.apply(null, values);
       var hi = Math.max.apply(null, values);
       var padY = Math.max((hi - lo) * 0.18, 60);
@@ -872,10 +875,20 @@ Do not edit docs/index.html - it is the output, this file is the source.
       base.textContent = "start " + usd0.format(D.start_equity);
       svg.appendChild(base);
 
+      // A point with no value for this series is a GAP, not a zero and
+      // not a NaN: the balance is known at every fill, equity only where
+      // it was measured and reconciled. Each run of known values starts
+      // its own subpath.
       function pathOf(key) {
-        return pts.map(function (p, i) {
-          return (i ? "L" : "M") + X(p.t).toFixed(1) + " " + Y(p[key]).toFixed(1);
-        }).join(" ");
+        var out = [], pen = false;
+        pts.forEach(function (p) {
+          var v = p[key];
+          if (v === null || v === undefined) { pen = false; return; }
+          out.push((pen ? "L" : "M") + X(p.t).toFixed(1) + " " +
+                   Y(v).toFixed(1));
+          pen = true;
+        });
+        return out.join(" ");
       }
 
       var dEquity = pathOf("equity");
@@ -885,7 +898,10 @@ Do not edit docs/index.html - it is the output, this file is the source.
       // neutral rather than green or red: the sign can flip inside the
       // window, and one fill colour across a crossing would state the
       // wrong sign for part of it.
-      var backwards = pts.slice().reverse().map(function (p) {
+      var marked = pts.filter(function (p) {
+        return p.equity !== null && p.equity !== undefined;
+      });
+      var backwards = marked.slice().reverse().map(function (p) {
         return "L" + X(p.t).toFixed(1) + " " + Y(p.balance).toFixed(1);
       }).join(" ");
       svg.appendChild(svgEl("path", {
@@ -1081,7 +1097,9 @@ Do not edit docs/index.html - it is the output, this file is the source.
       el("chartNote").textContent =
         "Balance is the start plus what is booked; equity adds the open marks, so the gap " +
         "between the lines is the open P&L of " + signed(D.unrealized, 0) + ".  ·  " +
-        "equity low " + usd0.format(Math.min.apply(null, D.curve.map(function (p) {
+        "equity low " + usd0.format(Math.min.apply(null, D.curve.filter(function (p) {
+          return p.equity !== null && p.equity !== undefined;
+        }).map(function (p) {
           return p.equity;
         }))) + "  ·  deepest drawdown " + signed(D.max_drawdown, 0);
 

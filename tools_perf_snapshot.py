@@ -350,6 +350,35 @@ def fetch_curve(cli: AlpacaCli, account: dict,
     return points, checks
 
 
+def read_equity_log(path: str) -> list[dict]:
+    """Every point this report has measured before, oldest first."""
+    rows: list[dict] = []
+    if not os.path.isfile(path):
+        return rows
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    rows.sort(key=lambda r: r["t"])
+    return rows
+
+
+def append_equity_point(path: str, point: dict) -> None:
+    """Add one measured point, unless this second is already recorded.
+
+    Append-only on purpose: a point that has been published is a thing
+    that was true at a moment, and rewriting history is the one thing this
+    report exists to make impossible.
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    existing = read_equity_log(path)
+    if existing and existing[-1]["t"] >= point["t"]:
+        return
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(point, sort_keys=True) + "\n")
+
+
 def funding(transfers: list[dict], first_fill: int | None) -> float:
     """Starting capital, read from the account's own cash bookings.
 
@@ -412,6 +441,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--equity-log", default="state/equity_log.jsonl",
+                    help="append-only record of every equity this report "
+                         "has measured; the curve is drawn from it")
     ap.add_argument("--max-attempts", type=int, default=10,
                     help="how many times to re-sample when a fill lands "
                          "inside the reading window")
@@ -525,6 +557,29 @@ def main() -> int:
             f"{unbooked_contracts:.0f} contracts could have accrued at "
             f"{PROVISIONAL_FEE_RATE} since the newest booked fee")
 
+    # The curve is this report's OWN measurements from here on. The
+    # broker's intraday series was measured 5,274.55 away from the account
+    # at the same instant, so it is not the quantity this page reports;
+    # the verified daily closes still seed the days before recording began.
+    now_ts = int(dt.datetime.fromisoformat(clock["timestamp"]).timestamp())
+    append_equity_point(args.equity_log, {
+        "t": now_ts,
+        "equity": round(equity, 2),
+        "balance": round(balance, 2),
+        "realized": round(realized, 2),
+        "fees": round(fees + fees_provisional, 2),
+    })
+    recorded = read_equity_log(args.equity_log)
+    earliest_recorded = recorded[0]["t"] if recorded else now_ts
+    # Only the days between the first fill and the start of recording are
+    # worth seeding. The 79 bars of the Friday before, all at exactly
+    # 100,000 because nothing had traded yet, said nothing and squashed
+    # everything that did into the right-hand edge.
+    seeded = [(t, e) for t, e in curve_points
+              if first_fill is not None and first_fill <= t < earliest_recorded]
+    if first_fill is not None and first_fill < earliest_recorded:
+        seeded.insert(0, (first_fill, start_equity))
+
     instruments = group_positions(positions)
     # Balance only moves when a fill books something, so it is a step
     # function sampled onto the equity bars by walking both sorted lists
@@ -532,7 +587,7 @@ def main() -> int:
     curve = []
     cursor = 0
     fee_cursor = 0
-    for t, e in curve_points:
+    for t, e in seeded:
         while cursor < len(events) and events[cursor]["t"] <= t:
             cursor += 1
         while (fee_cursor < len(fee_events)
@@ -548,18 +603,32 @@ def main() -> int:
             "pl": e - start_equity,
             "balance": start_equity + booked - charged,
         })
-    # The history endpoint's last bar is the last CLOSED bar, so the curve
-    # would stop minutes short of the equity in the headline and the
-    # drawdown would be measured over a different window than the one shown.
-    # The live point closes that gap, stamped with the BROKER's clock.
-    now_ts = int(dt.datetime.fromisoformat(clock["timestamp"]).timestamp())
-    if not curve or now_ts > curve[-1]["t"]:
-        curve.append({"t": now_ts, "equity": equity, "pl": equity - start_equity,
-                      "balance": balance})
+    # The balance moves only when a fill books something, and every fill
+    # is timestamped, so this line is exact for every minute of the week
+    # without asking any endpoint for it. equity is null here: it is not
+    # known between two measurements and will not be invented.
+    for e in events:
+        while fee_cursor < len(fee_events) and fee_events[fee_cursor]["t"] <= e["t"]:
+            fee_cursor += 1
+        charged = fee_events[fee_cursor - 1]["fees"] if fee_cursor else 0.0
+        curve.append({"t": e["t"], "equity": None, "pl": None,
+                      "balance": start_equity + e["realized"] - charged})
+
+    # Everything this report has measured itself, each point exactly as it
+    # was published at the time. No interpolation, no re-marking: the last
+    # entry IS the headline of this run.
+    for row in recorded:
+        curve.append({"t": row["t"],
+                      "equity": row["equity"],
+                      "pl": row["equity"] - start_equity,
+                      "balance": row["balance"]})
+    curve.sort(key=lambda point: point["t"])
 
     peak = start_equity
     max_dd = 0.0
     for point in curve:
+        if point["equity"] is None:
+            continue
         peak = max(peak, point["equity"])
         max_dd = min(max_dd, point["equity"] - peak)
 
@@ -589,6 +658,8 @@ def main() -> int:
         # What the curve was assembled from, so a reader can see which
         # days were verified and which were refused rather than trusting
         # that a check happened.
+        "curve_recorded_points": len(recorded),
+        "curve_seeded_points": len(seeded),
         "curve_spine_days": curve_checks["spine_days"],
         "curve_intraday_days": curve_checks["intraday_days"],
         "curve_rejected_days": curve_checks["rejected_days"],
