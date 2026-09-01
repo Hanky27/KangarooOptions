@@ -280,5 +280,7 @@ no retries, no fallbacks.
   (capped) spread width repeatedly. This tail is bounded by construction
   but unmeasured.
 - Strike/DTE/width selection is static (ATM, nearest expiry in window,
-  first available width) - the planned AI layer (underlying choice,
-  DTE/strike policy, risk gates) is not part of this core yet.
+  first available width). The AI layer covers **sizing only**: the risk
+  gate may shrink or veto a rebuy the grid has already decided on (see
+  `risk_gate.py`). Underlying choice and DTE/strike policy are still
+  rules, not judgements.
