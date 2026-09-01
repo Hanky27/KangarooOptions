@@ -21,6 +21,10 @@
 
 """The submission slide deck, with its numbers read from the snapshot.
 
+11 slides. The one that matters most is not the strategy or the model -
+it is what happened when the same simulator was asked to pay the spread
+it had never been charged.
+
 Every figure on these slides comes out of docs/snapshot.json - the file
 the live sheet reads and the cover is drawn from - so a deck rebuilt an
 hour later says what the account says an hour later, and no number on it
@@ -350,13 +354,38 @@ def build(snap: dict, out: str, cover: str | None) -> None:
     ], size=12)
     d.bullets(s, 4.75, [
         ("Every fix carries a regression test", "built from the account "
-                                                "data behind it. 90 tests."),
+                                                "data behind it. 93 tests."),
         ("The worst one was not a wrong number", "— it was 93 minutes of a "
                                                  "trading agent silently "
                                                  "not trading."),
     ], size=16, gap=0.66)
 
-    # 9 -- honest ----------------------------------------------------------
+    # 9 -- the finding ------------------------------------------------------
+    s = d.slide()
+    d.heading(s, "what the measuring found",
+              "The backtest never paid the bid/ask")
+    d.code(s, 2.35, [
+        "SPY put grid, 2024-02..2026-08, one parameter changed:",
+        "",
+        "   cost per spread per execution      realized      drawdown",
+        "   0     <- every published run       +2,850.00        -2,994",
+        "   17.00    median-based                -433.00        -3,716",
+        "   34.95    MEASURED on the live book -6,172.65        -7,024",
+    ], size=14, colour=INK)
+    d.bullets(s, 4.55, [
+        ("34.95 USD", "is half the bid/ask per spread, measured across 188 "
+                      "open legs. 69.89 round trip. Median quote width "
+                      "4.9 % of mid."),
+        ("The whole published profit", "was smaller than the cost that was "
+                                       "never charged. cost_usd now has "
+                                       "no default anywhere — every tool "
+                                       "refuses to start without it."),
+        ("And two fixes I proposed", "were refuted by their own tests. Both "
+                                     "are in the log, with the tables that "
+                                     "killed them."),
+    ], size=16, gap=0.72)
+
+    # 10 -- honest ---------------------------------------------------------
     s = d.slide()
     d.heading(s, "what is honest about this",
               "The parts that are not finished")
@@ -382,7 +411,7 @@ def build(snap: dict, out: str, cover: str | None) -> None:
         ("residual", f"{float(snap['residual']):+.4f}", ACCENT),
     ], size=22)
 
-    # 10 -- close ----------------------------------------------------------
+    # 11 -- close ----------------------------------------------------------
     s = d.slide()
     if cover:
         try:
@@ -409,7 +438,7 @@ def main() -> int:
     with open(args.snapshot, "r", encoding="utf-8") as fh:
         snap = json.load(fh)
     build(snap, args.out, args.cover)
-    print(f"{args.out}  (10 slides, snapshot as of {snap['as_of']})")
+    print(f"{args.out}  (11 slides, snapshot as of {snap['as_of']})")
     return 0
 
 
