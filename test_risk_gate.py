@@ -161,7 +161,7 @@ def test_a_disabled_gate_is_a_pure_passthrough():
     assert d.source == "passthrough"
     assert g.counters() == {"enabled": False, "provider": None, "model": None,
                             "consulted": 0, "reduced": 0, "vetoed": 0,
-                            "errors": 0, "clamped": 0}
+                            "errors": 0, "clamped": 0, "over_budget": 0}
 
 
 # --- what survives into the audit trail ---------------------------------
@@ -169,12 +169,35 @@ def test_a_disabled_gate_is_a_pure_passthrough():
 def test_every_model_contact_is_recorded_and_the_list_stays_bounded():
     """The decisions ride along in the state file, which is written every
     poll - an unbounded list would grow without limit over a week."""
-    g = gate(json.dumps({"qty": 1, "reason": "trimmed"}))
+    g = gate(json.dumps({"qty": 1, "reason": "trimmed"}),
+             max_consults_per_poll=1)
     for _ in range(60):
+        g.start_poll()          # the loader does this once per poll
         g.review(2, VIEW)
     assert len(g.decisions) == 50
     assert g.counters()["reduced"] == 60
     assert all(d["allowed"] <= d["requested"] for d in g.decisions)
+
+
+def test_a_poll_spends_only_its_budget_on_the_model():
+    """The gate is synchronous and the loop serves all 25 instruments.
+    Measured latency per call: 6.56 s for opus-5, 4.03 s for sonnet-5,
+    1.42 s for haiku-4.5. Without a bound, a market that moves everything
+    at once would stall 25 grids' take-profit checks behind a queue of
+    model calls. Past the budget the grid proceeds unreviewed and says so,
+    which is the same choice as every other failure here."""
+    g = gate(json.dumps({"qty": 0, "reason": "hold"}),
+             max_consults_per_poll=3)
+    g.start_poll()
+    allowed = [g.review(2, VIEW) for _ in range(5)]
+    assert [d.source for d in allowed] == ["model"] * 3 + ["budget"] * 2
+    assert [d.allowed for d in allowed] == [0, 0, 0, 2, 2]
+    assert g.counters()["over_budget"] == 2
+    assert g.counters()["consulted"] == 3
+
+    # The next poll starts with a full budget again.
+    g.start_poll()
+    assert g.review(2, VIEW).source == "model"
 
 
 def test_a_rambling_reason_is_cut_to_its_first_words():

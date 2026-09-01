@@ -888,7 +888,12 @@ class KangarooAgent:
         self.dry_run = dry_run
         self.poll_seconds = float(config["poll_seconds"])
         self.cli = AlpacaCli(config["cli_path"], config.get("env_file"))
-        self.gate = RiskGate(config.get("risk_gate") or {}, say=log)
+        # The gate's key defaults to the file the Alpaca credentials are
+        # already in: one secret file on the host, one ACL. An explicit
+        # risk_gate.key_file still wins.
+        gate_cfg = dict(config.get("risk_gate") or {})
+        gate_cfg.setdefault("key_file", config.get("env_file"))
+        self.gate = RiskGate(gate_cfg, say=log)
         self._reported_halted: list[str] = []
         config_dir = os.path.dirname(os.path.abspath(config_path))
         self.instruments = [
@@ -985,11 +990,17 @@ class KangarooAgent:
         dead = [i.name for i in self.instruments if i.halted]
         c = self.gate.counters()
         if c["enabled"]:
+            # read_key(), not os.environ: the key normally arrives through
+            # the host's credentials file, and a banner that only looks at
+            # the environment would report a working gate as broken.
+            found = self.gate.read_key()
+            where = self.gate.key_env if os.environ.get(self.gate.key_env)                 else os.path.basename(self.gate.key_file or '')
             log(f"risk gate: {c['provider']} {c['model']}, consulted from "
                 f"leg {self.gate.consult_from_leg} or below "
-                f"{self.gate.headroom_pct}% headroom, key from "
-                f"{self.gate.key_env}"
-                f"{' - NOT SET' if not os.environ.get(self.gate.key_env) else ''}")
+                f"{self.gate.headroom_pct}% headroom, at most "
+                f"{self.gate.max_per_poll} consults per poll, key "
+                f"{('from ' + where) if found else 'NOT FOUND - every '
+                   'consult will fail open and be counted'}")
         else:
             log("risk gate: disabled - the grid decides its own size")
         log(f"agent start: {len(live)} of {len(self.instruments)} "
@@ -1012,6 +1023,7 @@ class KangarooAgent:
             # the market is open: margin is what the gate reasons about and
             # it is not in the position list.
             portfolio = None
+            self.gate.start_poll()
             if self.gate.enabled and clock["is_open"]:
                 portfolio = self.portfolio_view(self.cli.account(),
                                                 stock_quotes)

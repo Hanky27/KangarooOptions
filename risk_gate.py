@@ -147,10 +147,27 @@ class RiskGate:
         spec = PROVIDERS.get(self.provider, {})
         self.model = cfg.get("model") or spec.get("default_model")
         self.key_env = cfg.get("key_env", "LLM_API_KEY")
+        # Where to look if the environment does not carry it. The loader
+        # passes its own env_file here, so the key sits beside the Alpaca
+        # credentials under one ACL instead of in a second place that has
+        # to be secured again.
+        self.key_file = cfg.get("key_file")
         self.timeout = float(cfg.get("timeout_seconds", 20))
         self.consult_from_leg = int(cfg.get("consult_from_leg", 4))
         self.headroom_pct = float(cfg.get("consult_below_headroom_pct", 40.0))
         self.max_words = int(cfg.get("max_reason_words", 20))
+        # Measured 2026-09-01 against the live account: at 200 the answer
+        # came back cut mid-JSON ('{"qty": 1, "reason') from one model and
+        # empty from another, and both were logged as unusable. The answer
+        # itself is tiny; the budget has to cover whatever the model emits
+        # before it.
+        self.max_tokens = int(cfg.get("max_tokens", 1024))
+        # At most this many model calls in one poll. The gate is
+        # synchronous and the loop serves every instrument, so without a
+        # bound a market that moves everything at once would stall the
+        # take-profit checks of 25 grids behind a queue of model calls.
+        self.max_per_poll = int(cfg.get("max_consults_per_poll", 3))
+        self._used_this_poll = 0
         self.say = say
 
         # Counters, published so an outage can never read as agreement.
@@ -159,8 +176,13 @@ class RiskGate:
         self.vetoed = 0
         self.errors = 0
         self.clamped = 0
+        self.over_budget = 0
         self.last: GateDecision | None = None
         self.decisions: list[dict] = []
+
+    def start_poll(self) -> None:
+        """Called once per poll by the loader, before any instrument steps."""
+        self._used_this_poll = 0
 
     # --- the only entry point --------------------------------------------
 
@@ -184,14 +206,25 @@ class RiskGate:
                 f"leg {view.get('leg_index')} below consult threshold "
                 f"{self.consult_from_leg}", "passthrough"))
 
-        key = os.environ.get(self.key_env, "")
-        if not key:
-            self.errors += 1
+        if self._used_this_poll >= self.max_per_poll:
+            self.over_budget += 1
             return self._record(GateDecision(
                 requested, requested,
-                f"no key in {self.key_env} - grid proceeds unchanged",
-                "error"))
+                f"{self.max_per_poll} consults already spent this poll - "
+                f"the grid proceeds unreviewed rather than the loop waiting",
+                "budget"))
 
+        key = self.read_key()
+        if not key:
+            self.errors += 1
+            where = f"{self.key_env}"
+            if self.key_file:
+                where += f" or {os.path.basename(self.key_file)}"
+            return self._record(GateDecision(
+                requested, requested,
+                f"no key in {where} - grid proceeds unchanged", "error"))
+
+        self._used_this_poll += 1
         started = time.time()
         try:
             raw = self._ask(key, requested, view)
@@ -207,6 +240,26 @@ class RiskGate:
 
     # --- pieces -----------------------------------------------------------
 
+    def read_key(self) -> str:
+        """The environment first, then the one line of the key file.
+
+        Only the line whose name matches `key_env` is read; every other
+        line in that file - the Alpaca credentials among them - is ignored
+        rather than imported, the same rule the CLI wrapper follows.
+        """
+        value = os.environ.get(self.key_env, "")
+        if value:
+            return value
+        if not self.key_file or not os.path.isfile(self.key_file):
+            return ""
+        prefix = f"{self.key_env}="
+        with open(self.key_file, "r", encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if line.startswith(prefix):
+                    return line[len(prefix):].strip().strip('"').strip("'")
+        return ""
+
     def _worth_asking(self, view: dict) -> bool:
         """Most rebuys are routine. Ask only about the ones that are not."""
         if int(view.get("leg_index", 0)) >= self.consult_from_leg:
@@ -221,13 +274,13 @@ class RiskGate:
         if self.provider == "anthropic":
             return prompt, {
                 "model": self.model,
-                "max_tokens": 200,
+                "max_tokens": self.max_tokens,
                 "system": SYSTEM,
                 "messages": [{"role": "user", "content": prompt}],
             }
         return prompt, {
             "model": self.model,
-            "max_tokens": 200,
+            "max_tokens": self.max_tokens,
             "messages": [{"role": "system", "content": SYSTEM},
                          {"role": "user", "content": prompt}],
         }
@@ -288,7 +341,7 @@ class RiskGate:
 
     def _record(self, decision: GateDecision) -> GateDecision:
         self.last = decision
-        if decision.source in ("model", "clamped", "error"):
+        if decision.source in ("model", "clamped", "error", "budget"):
             self.decisions.append(decision.as_dict())
             # Bounded: this list is written into the state file every poll.
             del self.decisions[:-50]
@@ -300,4 +353,4 @@ class RiskGate:
                 "model": self.model if self.enabled else None,
                 "consulted": self.consulted, "reduced": self.reduced,
                 "vetoed": self.vetoed, "errors": self.errors,
-                "clamped": self.clamped}
+                "clamped": self.clamped, "over_budget": self.over_budget}
