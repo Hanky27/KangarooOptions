@@ -757,7 +757,7 @@ Do not edit docs/index.html - it is the output, this file is the source.
     <div>
       <h3>How it is measured</h3>
       <p>Positions, fills, cash and the clock come from <code>alpaca</code>, the broker's own CLI. Realized P&amp;L is rebuilt by matching every fill against the contract it closes, at average cost &mdash; not taken from a field.</p>
-      <p>Fees are the OCC clearing fee of <code>0.025</code> per contract, the rate the account's cash is measured to be short by.</p>
+      <p>Fees are read from the account's own bookings &mdash; every <code>FEE</code> activity the broker recorded, summed &mdash; not from a rate. An earlier version of this page assumed the OCC clearing fee of <code>0.025</code> per contract and was right until the regulatory charges settled after the first close, at which point it was short by <code>7.37</code>.</p>
     </div>
     <div>
       <h3>What this is not</h3>
@@ -1088,7 +1088,7 @@ Do not edit docs/index.html - it is the output, this file is the source.
       var terms = [
         { k: "Realized", v: D.realized, note: "closed spreads, matched fill by fill" },
         { k: "Unrealized", v: D.unrealized, note: D.open_spreads + " spreads still open, at the mark" },
-        { k: "Fees", v: -D.fees, note: D.contracts_traded + " contracts × 0.025 clearing" }
+        { k: "Fees", v: -D.fees, note: (D.fee_bookings || 0) + " bookings read from the account" }
       ];
 
       el("terms").innerHTML =

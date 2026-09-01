@@ -245,9 +245,125 @@ Since then every P&L figure in this project is read from the **broker's
 order history** first, with the log quoted only as a comparison. A log can
 have holes; today it demonstrably did.
 
+## The day after: what the report was telling us
+
+The agent traded Monday without a further defect. The two found on
+Tuesday morning were both in the machinery that REPORTS on it, and one of
+them was on the public page for eighteen hours.
+
+They were found because a window kept opening on the desktop every five
+minutes. Nobody was watching the job; the job had been failing since
+09:55 CEST.
+
+### `8717fff` — the fee was a rate, and rates go stale
+
+**Symptom.** Every publish since 09:55 CEST aborted on
+`reconstruction does not close: ... residual -7.37 over 310 contracts`.
+The live page froze at its 09:50 snapshot. Twenty consecutive failures,
+no alarm.
+
+**Cause.** Measured against the account rather than reasoned about. The
+fills, realized, unrealized and fee model were all IDENTICAL to the last
+run that closed; only `cash` had moved, by exactly 7.37, with no fill
+between the two readings. A cash move without a fill is a non-trade
+activity, and the broker had 299 of them:
+
+| type | sub | n | sum |
+|---|---|---|---|
+| FEE | OCC | 294 | -9.14 |
+| FEE | ORF | 1 | -4.65 |
+| FEE | REG | 1 | -0.79 |
+| FEE | TAF | 1 | -0.44 |
+| FEE | CAT | 1 | -0.10 |
+| JNLC | | 1 | +100,000.00 |
+
+15.12 booked against 7.75 modelled — the difference is the residual, to
+the cent. The model was `0.025 USD x contracts`, which is the OCC
+clearing rate and was the entire fee on day one. The four regulatory
+charges settled at 20:0x UTC, after Monday's close, at rates no
+per-contract constant reaches. The OCC bookings themselves are -0.03 and
+-0.05, not 0.025 x quantity.
+
+**Fix.** `AlpacaCli.activities()` pages the account's non-trade bookings;
+the report sums the `FEE` rows and builds the chart's fee line from their
+`created_at` stamps. A booking it cannot classify aborts the run by name
+rather than being folded into a figure a reader takes for trading
+performance. Cash paid in before the first fill is starting capital; cash
+moved after it appears in the identity.
+
+**Confirmed.** `equity 97,854.88 ... fees 15.12 (298 bookings) residual
++0.0002`.
+
+### `8717fff` — and the curve was not this account
+
+**Symptom.** None. That is the point: the page looked fine and every
+number on it that a reader would check was right.
+
+**Cause.** `--period 1D --timeframe 5Min` returned 200,000 for the open
+of a day the account started at 100,000, and 199,130.16 for its close
+against the broker's own `last_equity` of 99,105.88. The published curve
+therefore ran flat at ~199,000 all Monday and fell off a cliff at the
+live point, and the page reported a **maximum drawdown of -102,137.75**
+that never happened.
+
+Measured one parameter at a time:
+
+| query | result |
+|---|---|
+| `--cashflow-types NONE` | identical output — excluded |
+| `--pnl-reset no_reset` | identical output — excluded |
+| `1D/1H` | +100,000.00 at every shared timestamp |
+| `2D/5Min` | first point correct, later ones inflated |
+| `5D/5Min`, `1W/5Min` | agree with `5D/1H` and with `account get` |
+| `1M/1D` | 99,105.88 — `last_equity` to the cent |
+
+Periods of 5D and longer read the account correctly; 1D and 2D do not.
+
+**Fix.** `fetch_curve` takes 5D/5Min and refuses to draw it until it
+agrees with a second series at every shared timestamp and with
+`last_equity` at the previous close. Points from before the account
+existed are dropped — the broker reports those as equity 0, and a zero in
+the curve is a 100 % drawdown in the drawdown line, the same defect
+wearing a different hat. The tolerance is 1 % of starting capital: the
+measured spread between two resolutions of the same true series is at
+most 111 USD on 99,000, and the defect it has to catch is 100,000.
+
+**Confirmed.** Curve starts at 100,000 at Monday 09:30 ET; maximum
+drawdown -2,145.12.
+
+### Why neither said anything
+
+The job runs every five minutes in a window nobody reads, and its log was
+UTF-16 while every search over it was ASCII — the same encoding trap as
+`3e00877`, in a second file. Under Windows PowerShell 5.1 with
+`ErrorActionPreference = Stop`, a bare native call dies on the first line
+its program writes to stderr, and the host renders that record AFTER the
+redirect has closed. For a scheduled task, that is nowhere. Measured:
+
+| pattern | what reaches the log |
+|---|---|
+| bare `& python ...` | the step banner, nothing else |
+| `2>&1`, SilentlyContinue | **count 0** — even when the command SUCCEEDS |
+| `2>$file`, SilentlyContinue | empty file |
+| try/catch under Stop | the first line only |
+| `2>&1`, Continue | the complete traceback, exit code intact |
+
+Both native programs go through one helper on `Continue` now, and it
+returns nothing unless asked: the `NativeCommandError` block that showed
+up in the log on the first run after that change was an ErrorRecord
+inside an *unconsumed return value*, not the preference talking. The task
+hides its window, writes UTF-8, and puts the reason for a failure into
+the log it failed in.
+
+**A rate that is right today is a wrong number tomorrow, and a series
+that is wrong looks exactly like a series that is right.** Both fixes are
+the same move: stop deriving a number, go and read it, and check it
+against a second source before showing it to anyone.
+
 ## What these findings have in common
 
-Every one of them was invisible to the backtest, and for the same reason:
+The five in the agent were invisible to the backtest, and for the same
+reason:
 the simulator asks the broker *what exists* and prices it, while the live
 agent additionally has to hold an account, *submit* orders, *re-submit*
 them, and survive being stopped between a fill and its booking. The
@@ -270,8 +386,25 @@ the honest answer to why a bot with 32 agent tests and 21 core tests still
 had five defects on its first trading morning, and why the tests written
 *after* each one are the part of this log that matters most.
 
-Every fix here carries a regression test that reproduces the live failure
-from the real data behind it: the TLT chain with its mixed dollar and
+The two found on Tuesday are a different animal, and the more
+uncomfortable one. They were not in the agent at all — the agent traded
+correctly through both — they were in what the project SAID about itself.
+A stale fee rate stopped the report loudly; a wrong equity series did not
+stop it at all, and put a drawdown of -102,137.75 on a public page for
+eighteen hours. Nothing in the output distinguishes a curve that is right
+from a curve that is wrong, which is why that one is now checked against
+a second reading of the same account before it is drawn.
+
+Neither would have been found by looking harder at the code. The fee
+defect was found by asking the broker what it had actually booked; the
+curve defect by asking the same account the same question two different
+ways and noticing the answers differed by 100,000. Both were found at all
+only because a console window kept opening on the desktop every five
+minutes.
+
+Every fix here carries a regression test that reproduces the failure from
+the real data behind it: the TLT chain with its mixed dollar and
 half-dollar grid, the GOOGL leg-on-its-own-wing collision, a filled close
-with no remaining position. The suite could not have found them first;
-it can keep them from coming back.
+with no remaining position, the six fee bookings at six different amounts,
+and the inflated 1D series set against the honest one. The suite could
+not have found them first; it can keep them from coming back.
