@@ -595,6 +595,72 @@ def test_a_list_at_exactly_the_limit_is_one_request():
     assert [len(b) for b in recorder.batches] == [100]
 
 
+class PagedOrderCli:
+    """Serves order pages of a fixed size and records how it was asked."""
+
+    def __init__(self, total):
+        self.rows = [{"id": f"o{i:04d}", "status": "filled",
+                      "client_order_id": f"kang_SPY_short_c{i}_l0_x_1"}
+                     for i in range(total)]
+        self.calls = []
+
+    def _run(self, args):
+        page = int(args[args.index("--limit") + 1])
+        start = 0
+        if "--after-order-id" in args:
+            after = args[args.index("--after-order-id") + 1]
+            start = next(i for i, r in enumerate(self.rows)
+                         if r["id"] == after) + 1
+        self.calls.append((start, page))
+        return self.rows[start:start + page]
+
+
+def test_the_order_list_is_paged_past_the_endpoints_cap():
+    """The endpoint caps a response at 500 - its own help says "Defaults
+    to 50 and max is 500" - and the previous version asked for 1000 and
+    checked the answer against 1000. A full page of 500 sailed past that
+    check and the caller got a truncated list that reported success.
+    Measured 2026-09-01: the list began at 15:20:41 UTC on a day whose
+    first order was at 13:30:10, and 331 orders were missing.
+
+    agent.py calls this at startup to ask the broker which clusters were
+    closed while it was stopped, so a missing close means a live cluster
+    kept that the account no longer holds - the phantom-cluster failure
+    2477d66 exists to prevent."""
+    cli = alpaca_cli.AlpacaCli.__new__(alpaca_cli.AlpacaCli)
+    server = PagedOrderCli(831)
+    cli._run = server._run
+
+    rows = alpaca_cli.AlpacaCli.orders_since(cli, "2026-08-31", page=500)
+    assert len(rows) == 831, len(rows)
+    assert [r["id"] for r in rows] == [r["id"] for r in server.rows]
+    assert server.calls == [(0, 500), (500, 500)], server.calls
+
+
+def test_a_list_that_never_ends_raises_rather_than_truncating():
+    """This list decides whether a live cluster is kept or booked, so
+    running out of pages is an error, not a result."""
+    cli = alpaca_cli.AlpacaCli.__new__(alpaca_cli.AlpacaCli)
+    server = PagedOrderCli(10_000)
+    cli._run = server._run
+    try:
+        alpaca_cli.AlpacaCli.orders_since(cli, "2026-08-31", page=100,
+                                          max_pages=3)
+    except alpaca_cli.AlpacaCliError as exc:
+        assert "may be incomplete" in str(exc), str(exc)
+    else:
+        raise AssertionError("it returned a possibly truncated list")
+
+
+def test_a_short_first_page_is_a_complete_answer():
+    cli = alpaca_cli.AlpacaCli.__new__(alpaca_cli.AlpacaCli)
+    server = PagedOrderCli(7)
+    cli._run = server._run
+    rows = alpaca_cli.AlpacaCli.orders_since(cli, "2026-08-31", page=500)
+    assert len(rows) == 7
+    assert len(server.calls) == 1
+
+
 def _closed_order(name, cluster, coid_kind="x"):
     return {"status": "filled",
             "client_order_id": f"kang_{name}_c{cluster}_l0_{coid_kind}_178"}

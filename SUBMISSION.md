@@ -158,15 +158,51 @@ Runs as a service on a dedicated VPS with a two-minute watchdog.
 
 ## What is honest about the result
 
-The grid parameters are inherited from the author's cTrader Forex bot and
-are **not** tuned for options or for a one-week window. The backtest
-window (Alpaca option data begins 2024-02) contains no sustained bear
-market, so the tail this strategy is exposed to is bounded by
-construction but unmeasured. Six defects were found and fixed while it
-traded live; each one is in [DEVLOG.md](DEVLOG.md) with the measurement
-that found it, the cause, and the regression test that now covers it.
+The account is **down**. Rather than explain that away, here is what was
+measured about it — because the measurement turned out to be the most
+useful thing this project produced.
 
-Two of those six were not in the agent at all — they were in what the
-project *said* about itself. One put a maximum drawdown of −102,137.75 on
-the public page that had never happened. Finding that mattered more than
-any single trade.
+**The backtests never paid the bid/ask.** `backtest_options.py` prices
+every option at the bar close, a traded print. Its `--cost_usd` parameter
+existed and every published run left it at 0. Measured on the live book:
+half the bid/ask is **34.95 USD per spread per crossing**, 69.89 round
+trip, median quote width 4.9 % of mid. Charging it changes the same
+2.5-year SPY run from **+2,850** to **−6,172.65**, and to −14,033.65 with
+both directions running. *The entire published profit was smaller than the
+cost that was never charged.* `cost_usd` now has no default anywhere —
+every tool refuses to start without it.
+
+**The live configuration was chosen on ten days.** Each instrument config
+carries its own provenance, and it reads `win rate 1.0`, `worst cluster
++15`, over `2026-08-14..2026-08-28`. A hundred-percent win rate over ten
+trading days is what an over-fitted window looks like, and the generator
+said so in the file it wrote.
+
+**Decision rate changes the strategy.** Same window, same parameters:
+daily bars give 1.32 legs per cluster and −186 USD; hourly gives 1.83 and
+**+4,781**; hourly with the measured cost gives −487. Every extra leg is
+another spread crossed, and a zero-cost simulator counts them as free
+upside. The live agent polls every five seconds.
+
+**A proposal of mine, refuted by its own test.** The obvious response to a
+deep grid is to brake earlier. Its deterministic form — a leg cap — is
+monotonically *worse* from 6 downward: the martingale recovers through the
+legs it adds. Across all 25 live configs a cap of 6 is worth +4,751.75 and
+takes 15 % off the drawdown, driven by four instruments where clusters ran
+deep and expired.
+
+**A lead that did not replicate.** Raising the take-profit looked
+convincing on SPY (−2,393.75 at 0.02 through +1,971.55 at 0.40). META
+peaks in the middle, QQQ is flat to worse, on 3–16 clusters each. It is in
+the log as a non-finding, because the SPY column alone would have made a
+good slide.
+
+Seven defects were found and fixed while it traded live; each is in
+[DEVLOG.md](DEVLOG.md) with the measurement that found it and the
+regression test that covers it. Three of them were not in the agent — they
+were in what the project *said* about itself, and one put a maximum
+drawdown of −102,137.75 on the public page that had never happened.
+
+The strategy still does what it was built to do: **59 clusters closed**
+for **+2,168 realized**, books reconciling to the cent, no halts. What was
+wrong was the expectation.

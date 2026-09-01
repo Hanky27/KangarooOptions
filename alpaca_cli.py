@@ -51,6 +51,11 @@ class AlpacaCliError(RuntimeError):
 # 2026-09-01 with 102 open legs.
 QUOTE_SYMBOL_LIMIT = 100
 
+# The most orders one `order list` response can carry. Not a choice: the
+# CLI's own help says "Defaults to 50 and max is 500", and asking for more
+# returns 500 with no indication that anything was left behind.
+PAGE_LIMIT = 500
+
 
 def in_batches(symbols: list[str], size: int = QUOTE_SYMBOL_LIMIT):
     """Split a symbol list into request-sized pieces, order preserved."""
@@ -177,66 +182,46 @@ class AlpacaCli:
         body = self._run(["position", "list"])
         return body if body else []
 
-    def orders_since(self, iso_ts: str, limit: int = 500) -> list[dict]:
-        """Every order submitted after `iso_ts`, any status.
+    def orders_since(self, iso_ts: str, page: int = PAGE_LIMIT,
+                     max_pages: int = 40) -> list[dict]:
+        """Every order submitted after `iso_ts`, any status, ALL of them.
 
         Used at startup to ask the broker what really happened to a close
         the agent may not have lived long enough to book. There is no
         lookup by client_order_id in the CLI (verified against
-        `order list --help`: --status, --limit, --after, --until,
-        --after-order-id only), so the window is fetched and filtered here.
-        A full page is an error rather than a silent truncation: the answer
-        would be missing exactly the orders it was asked about."""
-        body = self._run(["order", "list", "--status", "all",
-                          "--after", iso_ts, "--limit", str(limit)])
-        rows = body if isinstance(body, list) else (body.get("orders") or [])
-        if len(rows) >= limit:
-            raise AlpacaCliError(
-                f"orders_since({iso_ts}) hit the {limit} row limit - the "
-                f"list is truncated and a close could be missing from it")
-        return rows
+        `order list --help`), so the window is fetched and filtered here.
 
-    def activities(self, after: str, category: str = "non_trade_activity",
-                   page_size: int = 100) -> list[dict]:
-        """Every account booking of `category` created on or after `after`.
+        Paged, because the endpoint caps a response at 500 no matter what
+        is asked for - its help says so: "maximum number of orders in
+        response. Defaults to 50 and max is 500". The previous version
+        asked for 1000 and checked the answer against 1000, so a full page
+        of 500 sailed past the check and the caller got a truncated list
+        that reported success. Measured 2026-09-01: the list began at
+        15:20:41 UTC on a day whose first fill was at 13:40, and nothing
+        said so.
 
-        This is where fees, dividends, assignments and cash transfers
-        live - everything that moves cash without a fill. The report
-        reconciles against these instead of assuming a fee schedule,
-        because a rate that is right today is a wrong number tomorrow.
-
-        Paged to exhaustion. `--page-token` takes the id of the last row
-        of the previous page (verified against
-        `account activity list --help`), and a short page is the end of
-        the list.
-
-        The order is the BROKER'S, not booking order: `--direction asc`
-        sorts by the activity's own date, and the id it pages on carries
-        only a day stamp (`20260831000000000::<uuid>`), so rows of one day
-        come back in uuid order. Measured over 299 rows: first
-        created_at 18:29:19Z, last 15:19:08Z. A caller that needs a
-        running total in time order has to sort on `created_at` itself.
+        `--direction asc` with `--after-order-id` walks forward from the
+        oldest. A short page is the end. Running past `max_pages` raises
+        rather than returning what happens to have been collected: this
+        list decides whether a live cluster is kept or booked.
         """
-        rows: list[dict] = []
-        token: str | None = None
-        while True:
-            cmd = ["account", "activity", "list",
-                   "--category", category,
-                   "--after", after,
-                   "--page-size", str(page_size),
-                   "--direction", "asc"]
-            if token:
-                cmd += ["--page-token", token]
+        out: list[dict] = []
+        after_id: str | None = None
+        for _ in range(max_pages):
+            cmd = ["order", "list", "--status", "all", "--after", iso_ts,
+                   "--direction", "asc", "--limit", str(page)]
+            if after_id:
+                cmd += ["--after-order-id", after_id]
             body = self._run(cmd)
-            page = body if isinstance(body, list) else (
-                body.get("activities") or body.get("data") or [])
-            if not page:
-                break
-            rows += page
-            if len(page) < page_size:
-                break
-            token = page[-1]["id"]
-        return rows
+            rows = body if isinstance(body, list) else (body.get("orders") or [])
+            out += rows
+            if len(rows) < page:
+                return out
+            after_id = rows[-1]["id"]
+        raise AlpacaCliError(
+            f"orders_since({iso_ts}) still had pages after {max_pages} x "
+            f"{page} orders - refusing to decide a cluster's fate on a "
+            f"list that may be incomplete")
 
     def order_get(self, order_id: str) -> dict:
         return self._run(["order", "get", "--order-id", order_id])
