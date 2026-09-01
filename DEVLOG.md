@@ -489,6 +489,186 @@ that is wrong looks exactly like a series that is right.** Both fixes are
 the same move: stop deriving a number, go and read it, and check it
 against a second source before showing it to anyone.
 
+### `46c2d7d` — the curve, third attempt, and what a chart may claim
+
+**Symptom.** The published chart was four points and a cliff. The previous
+fix had refused today's intraday bars, correctly, and refusing them left
+nothing to draw.
+
+**Is the broker's series merely LAGGING?** It was worth asking: one bar had
+been seen revised downward by 961, toward the account. Read the same
+series twice, three minutes apart:
+
+| bar | read 1 | read 2 | moved |
+|---|---|---|---|
+| 13:00 ET | 95,671.88 | 95,587.88 | −84.00 |
+| 13:05 ET | 95,609.88 | 95,525.88 | −84.00 |
+| … eleven bars … | | | −84.00 |
+| 13:55 ET | 94,641.88 | 94,566.88 | −75.00 |
+| 14:05 ET | 95,209.88 | 95,079.88 | −130.00 |
+
+Eleven bars moved by *exactly the same amount at the same time*, and bars
+older than 65 minutes did not move at all. That is a block shift applied
+to a recent window, not marks settling one by one — and the newest bar
+still sat **4,016.40** above the account. The series does not converge to
+`account.equity` because it is not measuring it.
+
+**Could the past be re-marked instead?** Equity is not a number that has
+to be fetched:
+
+    equity(t) = cash(t) + sum over held contracts of qty(t) * mark(t) * 100
+
+`cash(t)` and `qty(t)` follow from the fills, which are timestamped to the
+millisecond. Only `mark(t)` has to come from outside.
+`tools_equity_backfill.py` does all of it and checks itself against the
+live measurements before writing a single point. It gets:
+
+```
+{"error": "OPRA agreement is not signed", "status": 403,
+ "path": ".../v1beta1/options/bars?..."}
+```
+
+Latest quotes work — that is the feed the agent trades on — but historical
+option BARS need an entitlement this account does not have. The past
+cannot be re-marked, by that tool or any other. The file stays: the dead
+end is worth recording and the reconstruction is correct the moment the
+entitlement exists.
+
+**Fix.** Draw what can be proved. The **balance** line moves only when a
+fill books something and every fill is timestamped, so it is exact for
+every minute of the week without asking anyone — 470 points and dense. The
+**equity** line keeps only the points this report measured itself and
+reconciled to the cent, and gains one every five minutes. A point with no
+value for a series is a GAP in the path, not a NaN: `pathOf` starts a new
+subpath after every hole, the y-range skips nulls, and the band between
+the lines — which is the open P&L — is drawn only where equity is known.
+
+**What this cost to learn.** Three attempts, and the first two were
+published. A chart is the one artefact where being wrong is invisible.
+
+## Why the backtests looked so much better
+
+The account sat at −9 % on day two while the strategy it runs was
+published as profitable. That gap is not a mood, it is a measurement, and
+this is it.
+
+### The live configuration is not the backtested one
+
+`configs/meta_short.yaml`, verbatim from its own header:
+
+```
+# Window 2026-08-14..2026-08-28, hourly RTH bars, real option chain.
+#   wins/week 7.73  trades/week 7.73  win rate 1.0
+#   net +1771 USD realized
+#   worst cluster +15   equity dd -2665
+# Ten trading days is a short window - every figure above carries
+# that caveat.
+```
+
+**A win rate of 1.0 over ten trading days**, worst cluster +15. All 25
+configs come from that search (`tools_week.py`), not from the 2.5-year
+sweep the README quotes.
+
+### The backtests never paid the bid/ask
+
+`backtest_options.py` prices every option at the bar CLOSE — a traded
+print. `--cost_usd` exists and every published run set it to **0**. The
+README already said so in one clause: *"marks are trade closes without
+spread costs"*.
+
+Measured on the live book, 188 open contract-legs:
+
+| | |
+|---|---|
+| half the bid/ask, whole book, one crossing | **3,284.90 USD** |
+| per contract-leg | 17.47 USD (median 8.50) |
+| per SPREAD, one crossing | **34.95 USD** |
+| round trip per spread | 69.89 USD |
+| median quote width | **4.9 % of mid** (worst quartile 7.8 %) |
+
+The same run, SPY put-only, 2024-02..2026-08, changing nothing but that
+number:
+
+| cost per spread per execution | realized | max drawdown |
+|---|---|---|
+| **0** — every published run | **+2,850.00** | −2,994 |
+| 17.00 — median-based | **−433.00** | −3,716 |
+| 34.95 — measured | **−6,172.65** | −7,024 |
+
+And with both directions running, as live: **−14,033.65**.
+
+**The entire published profit is smaller than the cost that was never
+charged.**
+
+### The faster it decides, the better it looks — and the worse it does
+
+Same window, same parameters, only the decision rate:
+
+| resolution | cost | realized | legs per cluster |
+|---|---|---|---|
+| daily | 0 | −186 | 1.32 |
+| daily | 34.95 | −2,379 | 1.29 |
+| **hourly** | **0** | **+4,781** | 1.83 |
+| hourly | 34.95 | −487 | 2.10 |
+
+Higher cadence produces more legs, every leg is another crossing, and a
+zero-cost backtest counts the extra legs as free upside. The live agent
+polls every **five seconds** and runs about 3.5 legs per cluster — more
+than any resolution ever tested.
+
+That is why the hourly week-search produced a win rate of 1.0.
+
+### A proposal of mine, tested and refuted
+
+The obvious response to a deep grid is to make the gate brake earlier —
+`consult_from_leg` from 4 to 2. Its deterministic equivalent is a cap on
+legs, and the cap was swept (SPY hourly, cost 34.95):
+
+| leg cap | realized | max drawdown |
+|---|---|---|
+| 20 | −486.90 | −2,967 |
+| **6** | **−482.35** | **−2,247** |
+| 4 | −2,278.60 | −3,007 |
+| 3 | −2,153.35 | −2,656 |
+| 2 | −3,042.35 | −3,414 |
+| 1 | −3,456.25 | −3,895 |
+
+**Braking earlier is monotonically worse.** The martingale recovers
+*through* the legs it adds; cutting them realises the loss the next leg
+would have earned back — which is what `max_adverse_pct`'s own design note
+says, and which I proposed to override anyway. The one thing worth
+keeping: a cap of **6** holds the result and takes 24 % off the drawdown.
+
+### A lead that did not replicate, recorded because it did not
+
+Raising the take-profit looked like the answer on SPY: 0.02 → −2,393.75,
+0.10 → −486.90, 0.20 → +689.05, 0.40 → +1,971.55. Monotone, sign-flipping,
+with a smaller drawdown. Two more symbols were run before it could be
+called a finding:
+
+| tp_pct | SPY | META | QQQ |
+|---|---|---|---|
+| 0.02 | −2,393.75 | +489.90 | −2,203.55 |
+| 0.10 | −486.90 | **+1,259.35** | −2,031.85 |
+| 0.20 | +689.05 | +667.55 | −2,310.20 |
+| 0.40 | +1,971.55 | +1,009.45 | −2,363.30 |
+
+META peaks in the middle, QQQ is flat to worse, and both ran on 3–16
+clusters. **It does not replicate.** The SPY column alone would have made
+a convincing slide, which is exactly why it is written down as a
+non-finding instead.
+
+### What is not broken
+
+44 clusters closed, **+2,135 realized**, a mean of +48.52 each. The books
+reconcile to the cent. 25 of 25 instruments live, no halts. The whole loss
+sits in open positions, and the market moved against them: 12 of 14
+underlyings down since Monday's open, median −1.43 %.
+
+The system does what it was built to do. What was wrong was the
+expectation — built on runs that charged no transaction cost, tuned on ten
+days with a 100 % win rate, at a decision rate slower than the real one.
+
 ## What these findings have in common
 
 The five in the agent were invisible to the backtest, and for the same

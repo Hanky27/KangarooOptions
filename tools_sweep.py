@@ -117,6 +117,9 @@ def run_cell(window: str, start_long: bool, **overrides) -> dict:
     res = bt.run(bars(window, symbol), params,
                  dte_min=run_kw.pop("dte_min", 4),
                  dte_max=run_kw.pop("dte_max", 10),
+                 # KeyError rather than a default: a sweep that forgot to
+                 # price execution is the exact mistake this is guarding.
+                 cost_usd=run_kw.pop("cost_usd"),
                  underlying=symbol, style="short_premium_spreads",
                  regime=run_kw.pop("regime", "same"),
                  timeframe="1Hour", **run_kw)

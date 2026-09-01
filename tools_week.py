@@ -95,8 +95,13 @@ def trend_pct(symbol: str, window: tuple[str, str]) -> float:
 
 
 def run_cell(symbol: str, start_long: bool, window: tuple[str, str],
-             **overrides) -> dict:
-    """One symbol, one direction, one parameter set."""
+             cost_usd: float, **overrides) -> dict:
+    """One symbol, one direction, one parameter set.
+
+    cost_usd is positional and has no default: this function chooses the
+    configs that go live, and it once chose 25 of them in a world where
+    execution was free.
+    """
     params = dict(bt.DEFAULT_PARAMS)
     params["start_long"] = start_long
     grid = {k: v for k, v in overrides.items() if k in params}
@@ -108,6 +113,7 @@ def run_cell(symbol: str, start_long: bool, window: tuple[str, str],
     res = bt.run(rows, params,
                  dte_min=run_kw_dte_min,
                  dte_max=run_kw_dte_max,
+                 cost_usd=cost_usd,
                  underlying=symbol, style="short_premium_spreads",
                  regime=run_kw.pop("regime", "same"),
                  timeframe="1Hour", **run_kw)
@@ -130,6 +136,9 @@ def run_cell(symbol: str, start_long: bool, window: tuple[str, str],
         # the generated config so no later loader can reinterpret them.
         "params": {k: params[k] for k in CORE_KEYS},
         "dte_min": run_kw_dte_min, "dte_max": run_kw_dte_max,
+        # Travels into the generated config so the next reader knows what
+        # this measurement was allowed to ignore.
+        "cost_usd": cost_usd,
         "trades": len(clusters),
         "wins": len(wins),
         "win_rate": round(len(wins) / len(clusters), 3) if clusters else None,
@@ -152,7 +161,8 @@ TP_CANDIDATES = [0.02, 0.04, 0.08]
 SIDES = [True, False]
 
 
-def search(symbol: str, window: tuple[str, str] = WINDOW) -> list[dict]:
+def search(symbol: str, cost_usd: float,
+           window: tuple[str, str] = WINDOW) -> list[dict]:
     """Every candidate for one symbol, ranked by wins per week."""
     out = []
     for dte_min, dte_max in DTE_CANDIDATES:
@@ -160,6 +170,7 @@ def search(symbol: str, window: tuple[str, str] = WINDOW) -> list[dict]:
             for start_long in SIDES:
                 try:
                     row = run_cell(symbol, start_long, window,
+                                   cost_usd,
                                    dte_min=dte_min, dte_max=dte_max,
                                    tp_pct=tp, max_adverse_pct=5.0)
                 except Exception as exc:          # noqa: BLE001
@@ -174,13 +185,38 @@ def search(symbol: str, window: tuple[str, str] = WINDOW) -> list[dict]:
     return out
 
 
+USAGE = """usage: tools_week.py --cost-usd <USD> [SYMBOL ...]
+
+--cost-usd is the execution cost per spread per EXECUTION, and it is
+required. Measured on the live book 2026-09-01: half the bid/ask is 34.95
+USD per spread per crossing. The 25 configs this project trades were all
+chosen with it implicitly at 0. What charging it does has been measured on
+three symbols only (SPY, META, QQQ) and it is not uniform - SPY turns from
++2,850 to -6,172.65 over 2.5 years, META stays positive. What is certain is
+that none of them was ever measured against it.
+
+Pass 0 for a frictionless run - explicitly."""
+
+
 def main() -> int:
-    symbols = [s.upper() for s in sys.argv[1:]] or ["SPY"]
+    argv = sys.argv[1:]
+    if "--cost-usd" not in argv:
+        print(USAGE)
+        return 2
+    i = argv.index("--cost-usd")
+    try:
+        cost_usd = float(argv[i + 1])
+    except (IndexError, ValueError):
+        print(USAGE)
+        return 2
+    del argv[i:i + 2]
+    symbols = [s.upper() for s in argv] or ["SPY"]
+    print(f"execution cost: {cost_usd:.2f} USD per spread per execution")
     for sym in symbols:
         t = trend_pct(sym, WINDOW)
         print(f"\n=== {sym}  (underlying {t:+.2f} % over "
               f"{WINDOW[0]}..{WINDOW[1]}) ===")
-        rows = search(sym)
+        rows = search(sym, cost_usd)
         good = [r for r in rows if "error" not in r]
         bad = [r for r in rows if "error" in r]
         good.sort(key=lambda r: (-r["wins_per_week"], -r["net"]))

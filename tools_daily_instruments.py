@@ -70,6 +70,7 @@ def measure(symbol: str, start_long: bool, **overrides) -> dict:
     params.update({k: v for k, v in overrides.items() if k in params})
     run_kw = {k: v for k, v in overrides.items() if k not in params}
     res = bt.run(daily_bars(symbol), params, dte_min=4, dte_max=10,
+                 cost_usd=run_kw.pop("cost_usd"),
                  underlying=symbol, style="short_premium_spreads",
                  regime="same", timeframe="1Day", **run_kw)
     eq = [r + o for (_, r, o) in res["equity"]]
@@ -87,16 +88,41 @@ def measure(symbol: str, start_long: bool, **overrides) -> dict:
             "worst": round(min((c["result_usd"] for c in cl), default=0))}
 
 
+def _cost_from_argv(argv: list[str], usage: str) -> float:
+    """--cost-usd, required, removed from argv in place.
+
+    No default: this tool's output is read as evidence, and it was read as
+    evidence for two and a half years of runs in which execution was free.
+    """
+    if "--cost-usd" not in argv:
+        raise SystemExit(usage)
+    i = argv.index("--cost-usd")
+    try:
+        value = float(argv[i + 1])
+    except (IndexError, ValueError):
+        raise SystemExit(usage)
+    del argv[i:i + 2]
+    return value
+
+
+USAGE = ("usage: tools_daily_instruments.py --cost-usd <USD> [SYMBOL ...]"
+         "\n\nMeasured on the live book 2026-09-01: half the bid/ask is "
+         "34.95 USD per\nspread per crossing. Pass 0 explicitly for a "
+         "frictionless run.")
+
+
 if __name__ == "__main__":
-    syms = sys.argv[1:] or ["SPY", "TLT", "DIA", "XLP"]
+    _argv = sys.argv[1:]
+    COST_USD = _cost_from_argv(_argv, USAGE)
+    syms = _argv or ["SPY", "TLT", "DIA", "XLP"]
     print(f"Daily grid, {START}..{END} (2,5 Jahre), max_adverse_pct=5, "
-          f"spread_width_pct=0.71")
+          f"spread_width_pct=0.71, cost {COST_USD:.2f} USD/spread/execution")
     for sym in syms:
         for side, sl in (("long", True), ("short", False)):
             t = time.time()
             try:
                 m = measure(sym, sl, max_adverse_pct=5.0,
-                            spread_width_pct=0.71)
+                            spread_width_pct=0.71, cost_usd=COST_USD)
                 print(f"  {sym:4s} {side:5s}: net {m['net']:+7,.0f} | "
                       f"DD {m['dd']:+8,.0f} | r {m['r']} | "
                       f"{m['clusters']:3d} Cluster | Margin {m['margin']:6,.0f} | "

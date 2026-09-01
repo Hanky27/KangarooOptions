@@ -360,12 +360,23 @@ def pick_spread(underlying: str, entry_stamp: str, right: str, close: float,
 # --- simulation ----------------------------------------------------------
 
 def run(bars: list[dict], params: dict, dte_min: int, dte_max: int,
+        cost_usd: float,
         spread_width_pct: float = 0.0,
         underlying: str = "SPY", sma: dict[str, float] | None = None,
         style: str = "long_options", regime: str = "mode1",
-        cost_usd: float = 0.0, timeframe: str = "1Day",
+        timeframe: str = "1Day",
         on_day=None, on_cluster=None) -> dict:
-    """cost_usd: execution cost in USD per spread/contract per EXECUTION -
+    """cost_usd has NO DEFAULT, deliberately.
+
+    It used to default to 0.0 and tools_week.py never passed it, so every
+    instrument config this project trades was chosen by a search in which
+    execution was free. Measured on the live book 2026-09-01: half the
+    bid/ask is 34.95 USD per spread per crossing, and charging it turns
+    this simulator's published +2,850 USD over 2.5 years into -6,172.65.
+    A frictionless run is a legitimate thing to ask for and an
+    indefensible thing to inherit, so the caller writes the zero down.
+
+    cost_usd: execution cost in USD per spread/contract per EXECUTION -
     charged once at every leg open and once at every TP close; an expired
     leg has no closing trade and therefore no exit cost. The take-profit
     TRIGGER stays cost-free (the original grid knows no costs); the costs
@@ -668,8 +679,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bars", default="data/spy_daily.json")
     parser.add_argument("--underlying", default="SPY")
-    parser.add_argument("--cost_usd", type=float, default=0.0,
-                        help="execution cost per spread per execution (USD)")
+    parser.add_argument("--cost_usd", type=float, required=True,
+                        help="execution cost per spread per EXECUTION (USD), "
+                             "charged at every leg open and every TP close. "
+                             "REQUIRED: measured 34.95 on the live book on "
+                             "2026-09-01, and the difference between this "
+                             "simulator reporting +2,850 and -6,172.65 over "
+                             "the same 2.5 years. Pass 0 for a frictionless "
+                             "run - explicitly.")
     parser.add_argument("--start", default="2024-02-01")
     parser.add_argument("--dte-min", type=int, default=4)
     parser.add_argument("--dte-max", type=int, default=10)

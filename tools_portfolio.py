@@ -81,6 +81,7 @@ def run_one(cfg: dict, window: tuple[str, str]) -> dict:
     sym = cfg["underlying"].upper()
     return bt.run(bars(sym, window), params,
                   dte_min=int(cfg["dte_min"]), dte_max=int(cfg["dte_max"]),
+                  cost_usd=cost_usd,
                   underlying=sym, style="short_premium_spreads",
                   regime="same", timeframe="1Hour")
 
@@ -100,8 +101,34 @@ def align(series_by_name: dict[str, list[tuple[str, float]]]) -> \
     return stamps, out
 
 
+def _cost_from_argv(argv: list[str], usage: str) -> float:
+    """--cost-usd, required, removed from argv in place.
+
+    No default: this tool's output is read as evidence, and it was read as
+    evidence for two and a half years of runs in which execution was free.
+    """
+    if "--cost-usd" not in argv:
+        raise SystemExit(usage)
+    i = argv.index("--cost-usd")
+    try:
+        value = float(argv[i + 1])
+    except (IndexError, ValueError):
+        raise SystemExit(usage)
+    del argv[i:i + 2]
+    return value
+
+
+USAGE = ("usage: tools_portfolio.py --cost-usd <USD> [START END]"
+         "\n\nMeasured on the live book 2026-09-01: half the bid/ask is "
+         "34.95 USD per\nspread per crossing. Pass 0 explicitly for a "
+         "frictionless run.")
+
+
 def main() -> int:
-    window = (tuple(sys.argv[1:3]) if len(sys.argv) >= 3 else WINDOW)
+    argv = sys.argv[1:]
+    cost_usd = _cost_from_argv(argv, USAGE)
+    print(f"execution cost {cost_usd:.2f} USD per spread per execution")
+    window = (tuple(argv[0:2]) if len(argv) >= 2 else WINDOW)
     in_sample = window == WINDOW
     files = sorted(glob.glob(os.path.join(CONFIG_DIR, "*.yaml")))
     if not files:
