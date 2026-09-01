@@ -35,6 +35,7 @@ import tempfile
 from datetime import date
 
 import agent as agent_mod
+import alpaca_cli
 import risk_gate
 from agent import (Instrument, SingleInstance,
                    load_instrument_configs)
@@ -547,6 +548,51 @@ def test_short_grid_sells_calls_with_the_wing_above():
     assert spread["strike"] == 770.0, spread
     assert spread["wing_strike"] == 775.0, spread
     assert spread["credit_limit"] > 0, spread
+
+
+class BatchCli:
+    """Records every symbol list the wrapper actually sends."""
+
+    def __init__(self):
+        self.batches = []
+
+    def _run(self, args):
+        symbols = args[args.index("--symbols") + 1].split(",")
+        self.batches.append(symbols)
+        return {"quotes": {s: {"bp": 1.0, "ap": 1.1} for s in symbols}}
+
+
+def test_quote_requests_are_split_at_the_endpoints_symbol_limit():
+    """Measured 2026-09-01 at 18:03 CEST: the grid crossed 100 open legs
+    and every poll from then on asked for 102 symbols in one request. The
+    endpoint answered {"error": "symbol limit is 100", "status": 400}
+    with NO quotes at all, so market_data() raised before the first
+    instrument was stepped. 25 grids with open positions went unmanaged
+    for 93 minutes while the market was open, restarted by the watchdog
+    every two minutes and killed the same way each time."""
+    occs = [f"SPY2609{i:02d}P00700000" for i in range(102)]
+    cli = alpaca_cli.AlpacaCli.__new__(alpaca_cli.AlpacaCli)
+    recorder = BatchCli()
+    cli._run = recorder._run
+
+    quotes = alpaca_cli.AlpacaCli.option_quotes(cli, occs)
+    assert len(quotes) == 102, len(quotes)
+    assert [len(b) for b in recorder.batches] == [100, 2]
+    assert sorted(sum(recorder.batches, [])) == sorted(occs)
+
+    recorder.batches.clear()
+    stock = alpaca_cli.AlpacaCli.stock_quotes(cli, ["SPY", "QQQ"])
+    assert len(stock) == 2
+    assert [len(b) for b in recorder.batches] == [2]
+
+
+def test_a_list_at_exactly_the_limit_is_one_request():
+    occs = [f"SPY2609{i:02d}P00700000" for i in range(100)]
+    cli = alpaca_cli.AlpacaCli.__new__(alpaca_cli.AlpacaCli)
+    recorder = BatchCli()
+    cli._run = recorder._run
+    alpaca_cli.AlpacaCli.option_quotes(cli, occs)
+    assert [len(b) for b in recorder.batches] == [100]
 
 
 def _closed_order(name, cluster, coid_kind="x"):

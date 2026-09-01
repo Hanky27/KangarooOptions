@@ -45,6 +45,19 @@ class AlpacaCliError(RuntimeError):
     pass
 
 
+# The most symbols one latest-quotes request accepts. Not a guess: the
+# endpoint answers `{"error": "symbol limit is 100", "status": 400}` and
+# returns NOTHING when the list is longer, which is how the agent died on
+# 2026-09-01 with 102 open legs.
+QUOTE_SYMBOL_LIMIT = 100
+
+
+def in_batches(symbols: list[str], size: int = QUOTE_SYMBOL_LIMIT):
+    """Split a symbol list into request-sized pieces, order preserved."""
+    for start in range(0, len(symbols), size):
+        yield symbols[start:start + size]
+
+
 class AlpacaCli:
     def __init__(self, cli_path: str, env_file: str | None = None) -> None:
         if not os.path.isfile(cli_path):
@@ -111,19 +124,36 @@ class AlpacaCli:
         return body["quote"]
 
     def stock_quotes(self, symbols: list[str]) -> dict[str, dict]:
-        """Latest NBBO quotes for several underlyings in ONE request:
-        {symbol: {'ap','bp','t',...}}. The single-symbol endpoint costs one
-        request per symbol, which makes the poll rate scale with the number
-        of instruments; this one does not."""
-        body = self._run(["data", "latest-quotes",
-                          "--symbols", ",".join(symbols)])
-        return body["quotes"]
+        """Latest NBBO quotes for several underlyings, batched:
+        {symbol: {'ap','bp','t',...}}.
+
+        The single-symbol endpoint costs one request per symbol, which
+        makes the poll rate scale with the number of instruments. This one
+        costs one request per QUOTE_SYMBOL_LIMIT symbols instead - a
+        ceiling the endpoint enforces with a 400 and no partial result.
+        """
+        quotes: dict[str, dict] = {}
+        for batch in in_batches(symbols):
+            body = self._run(["data", "latest-quotes",
+                              "--symbols", ",".join(batch)])
+            quotes.update(body["quotes"])
+        return quotes
 
     def option_quotes(self, symbols: list[str]) -> dict[str, dict]:
-        """Latest quotes for OCC option symbols: {symbol: {'ap','bp','t',...}}."""
-        body = self._run(["data", "option", "latest-quotes",
-                          "--symbols", ",".join(symbols)])
-        return body["quotes"]
+        """Latest quotes for OCC option symbols, batched the same way.
+
+        This is the one that broke: the grid crossed 100 open legs on
+        2026-09-01 and every poll from then on asked for 102 symbols at
+        once. The endpoint answered `symbol limit is 100` with status 400
+        and no quotes at all, so market_data() raised before the first
+        instrument was stepped and 25 grids went unmanaged for 93 minutes.
+        """
+        quotes: dict[str, dict] = {}
+        for batch in in_batches(symbols):
+            body = self._run(["data", "option", "latest-quotes",
+                              "--symbols", ",".join(batch)])
+            quotes.update(body["quotes"])
+        return quotes
 
     def option_contracts(self, underlying: str, exp_gte: str, exp_lte: str,
                          type_: str) -> list[dict]:
