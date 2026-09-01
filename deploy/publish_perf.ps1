@@ -73,48 +73,91 @@ $ErrorActionPreference = 'Stop'
 function Step($m) { Write-Host "==> $m" -ForegroundColor Cyan }
 function Ok($m) { Write-Host "    $m" -ForegroundColor Green }
 
-# git reports progress on STDERR even when it succeeds ("To github.com:...",
-# "Switched to a new branch"). Called bare while the whole script's output
-# is redirected to a file, those lines arrive as ErrorRecords, and with
-# ErrorActionPreference = Stop they terminate a run that had already done
-# its work - measured: the scheduled task pushed the commit and still
-# exited 1, with the log cut off mid-step. Capturing the streams here keeps
-# stderr as text and leaves the exit code as the only verdict.
+# Every native program this script runs writes to stderr, and both do it
+# for reasons that are not failures. git reports progress there even when
+# it succeeds ("To github.com:...", "Switched to a new branch"); Python
+# puts its traceback there when it does not. Called bare while the whole
+# run is redirected to a file, those lines arrive as ErrorRecords, and
+# with ErrorActionPreference = Stop they terminate the script - measured
+# twice, and in opposite directions:
 #
+#   git   the scheduled task pushed the commit and still exited 1, with
+#         the log cut off mid-step.
+#   py    20 consecutive publishes died leaving the step banner and
+#         NOTHING else, because the record that carried the traceback was
+#         rendered by the parent host AFTER the redirect had closed.
+#
+# Routing both through one helper keeps stderr as text inside the log and
+# leaves the exit code as the only verdict.
+#
+function Invoke-Native {
+   param(
+      [Parameter(Mandatory = $true)][string]$Exe,
+      [switch]$PassThru,
+      [Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+   # ErrorActionPreference is lowered for the native call ONLY, and to
+   # Continue rather than SilentlyContinue. Windows PowerShell 5.1 - which
+   # is what the scheduled task starts - raises a terminating
+   # NativeCommandError for anything a native program writes to stderr
+   # while the preference is Stop, and it does so BEFORE 2>&1 can merge
+   # the streams. Measured on a push that had already succeeded:
+   #   git.exe : To github.com:Hanky27/KangarooOptions.git
+   #   FullyQualifiedErrorId : NativeCommandError
+   #
+   # The choice of Continue over SilentlyContinue is measured, not
+   # stylistic. Under SilentlyContinue the capture comes back EMPTY -
+   # count 0 - even for a command that writes to stderr and then
+   # SUCCEEDS: the records are discarded rather than merged, so stdout
+   # survives and stderr is lost. A file redirect under that preference
+   # measured empty too. Under Continue the same call returns every line
+   # (measured: a complete 4-line Python traceback, exit code intact).
+   # That difference is why 20 consecutive publishes failed leaving
+   # nothing behind but the step banner.
+   #
+   # Nothing is returned unless the caller asks. Measured on the first run
+   # after Continue went in: the push appeared in the log twice, once as
+   # the indented lines below and once as a rendered NativeCommandError
+   # block - that block is an ErrorRecord inside an unconsumed return
+   # value, formatted by PowerShell the way it formats any uncaught error.
+   # Under the old preference the same return carried plain strings and
+   # duplicated quietly instead.
+   #
+   # This is not a softened check: the exit code below is still the only
+   # verdict, and it still throws.
+   $previous = $ErrorActionPreference
+   $ErrorActionPreference = 'Continue'
+   try {
+      $merged = & $Exe @Arguments 2>&1
+      $code = $LASTEXITCODE
+   } finally {
+      $ErrorActionPreference = $previous
+   }
+   foreach ($item in $merged) {
+      if ("$item".Trim()) { Write-Host "    $item" }
+   }
+   if ($code -ne 0) {
+      throw "$Exe $($Arguments -join ' ') failed ($code)"
+   }
+   if ($PassThru) {
+      # The SUCCESS stream only. The one caller that reads this parses it
+      # with -split, and a progress line from stderr arriving first would
+      # hand it the wrong token.
+      return @($merged |
+         Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } |
+         ForEach-Object { "$_" })
+   }
+}
+
 # The name matters and git.exe is spelled out: PowerShell resolves command
 # names case-insensitively and puts FUNCTIONS ahead of executables, so a
 # helper called "Git" that runs "& git" calls ITSELF - measured, it dies
 # with CallDepthOverflow after recursing. Invoke-Git cannot shadow git.exe,
 # and naming the executable in full removes the question altogether.
 function Invoke-Git {
-   param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
-   # ErrorActionPreference is lowered for the native call ONLY. Windows
-   # PowerShell 5.1 - which is what the scheduled task starts - raises a
-   # terminating NativeCommandError for anything a native program writes to
-   # stderr while the preference is Stop, and it does so BEFORE the 2>&1
-   # can merge the streams. Measured on a push that had already succeeded:
-   #   git.exe : To github.com:Hanky27/KangarooOptions.git
-   #   FullyQualifiedErrorId : NativeCommandError
-   # This is not a softened check: the exit code below is still the only
-   # verdict, and it still throws.
-   # SilentlyContinue, not Continue, and 2>&1 rather than a file: both
-   # variants were measured under Windows PowerShell 5.1 on a push that
-   # SUCCEEDED, and both still produce the NativeCommandError record - a
-   # file redirect even logs it twice. The preference is the only thing
-   # that keeps it out of the log. Nothing is lost: 2>&1 puts git's own
-   # words into $out, which is printed line by line below, and the exit
-   # code is still the only verdict.
-   $previous = $ErrorActionPreference
-   $ErrorActionPreference = 'SilentlyContinue'
-   try {
-      $out = & git.exe @Arguments 2>&1
-      $code = $LASTEXITCODE
-   } finally {
-      $ErrorActionPreference = $previous
-   }
-   foreach ($line in $out) { if ("$line".Trim()) { Write-Host "    $line" } }
-   if ($code -ne 0) { throw "git $($Arguments -join ' ') failed ($code)" }
-   return $out
+   param(
+      [switch]$PassThru,
+      [Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
+   return Invoke-Native -Exe 'git.exe' -PassThru:$PassThru @Arguments
 }
 
 # --- 0. everything this needs must be there, or stop here ---------------
@@ -145,9 +188,8 @@ $docs = Join-Path $RepoDir 'docs'
 if (-not (Test-Path $docs)) { New-Item -ItemType Directory $docs | Out-Null }
 $snapshot = Join-Path $docs 'snapshot.json'
 
-& $Python (Join-Path $RepoDir 'tools_perf_snapshot.py') `
+Invoke-Native -Exe $Python (Join-Path $RepoDir 'tools_perf_snapshot.py') `
    --config (Join-Path $RepoDir 'config.yaml') --out $snapshot
-if ($LASTEXITCODE -ne 0) { throw "tools_perf_snapshot.py failed ($LASTEXITCODE)" }
 
 # The snapshot writes itself only when its terms reconcile, so reaching
 # this line already means the numbers close. What is checked here is that
@@ -159,13 +201,12 @@ Ok "snapshot as of $asOf"
 
 if ($RebuildPage) {
    Step 'Rendering docs/index.html'
-   & $Python (Join-Path $RepoDir 'tools_perf_page.py') `
+   Invoke-Native -Exe $Python (Join-Path $RepoDir 'tools_perf_page.py') `
       --snapshot $snapshot `
       --template (Join-Path $RepoDir 'perf_page.tpl.html') `
       --out (Join-Path $docs 'index.html') `
       --live-url $rawUrl `
       --repo-url "https://github.com/$owner/$repo"
-   if ($LASTEXITCODE -ne 0) { throw "tools_perf_page.py failed ($LASTEXITCODE)" }
 }
 
 if ($Check) {
@@ -218,7 +259,8 @@ Invoke-Git -C $work push --force origin "${DataBranch}:${DataBranch}"
 # The push having returned is not proof it landed - ask the remote what it
 # now holds and compare it with what was just committed.
 $local = (& git -C $work rev-parse HEAD).Trim()
-$remoteHead = ((Invoke-Git -C $work ls-remote origin $DataBranch) -split '\s+')[0]
+$remoteHead = ((Invoke-Git -PassThru -C $work ls-remote origin $DataBranch) `
+   -split '\s+')[0]
 if ($local -ne $remoteHead) {
    throw "push reported success but origin/$DataBranch is $remoteHead, not $local"
 }

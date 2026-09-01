@@ -166,6 +166,48 @@ class AlpacaCli:
                 f"list is truncated and a close could be missing from it")
         return rows
 
+    def activities(self, after: str, category: str = "non_trade_activity",
+                   page_size: int = 100) -> list[dict]:
+        """Every account booking of `category` created on or after `after`.
+
+        This is where fees, dividends, assignments and cash transfers
+        live - everything that moves cash without a fill. The report
+        reconciles against these instead of assuming a fee schedule,
+        because a rate that is right today is a wrong number tomorrow.
+
+        Paged to exhaustion. `--page-token` takes the id of the last row
+        of the previous page (verified against
+        `account activity list --help`), and a short page is the end of
+        the list.
+
+        The order is the BROKER'S, not booking order: `--direction asc`
+        sorts by the activity's own date, and the id it pages on carries
+        only a day stamp (`20260831000000000::<uuid>`), so rows of one day
+        come back in uuid order. Measured over 299 rows: first
+        created_at 18:29:19Z, last 15:19:08Z. A caller that needs a
+        running total in time order has to sort on `created_at` itself.
+        """
+        rows: list[dict] = []
+        token: str | None = None
+        while True:
+            cmd = ["account", "activity", "list",
+                   "--category", category,
+                   "--after", after,
+                   "--page-size", str(page_size),
+                   "--direction", "asc"]
+            if token:
+                cmd += ["--page-token", token]
+            body = self._run(cmd)
+            page = body if isinstance(body, list) else (
+                body.get("activities") or body.get("data") or [])
+            if not page:
+                break
+            rows += page
+            if len(page) < page_size:
+                break
+            token = page[-1]["id"]
+        return rows
+
     def order_get(self, order_id: str) -> dict:
         return self._run(["order", "get", "--order-id", order_id])
 
