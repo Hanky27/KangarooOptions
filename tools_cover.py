@@ -19,15 +19,20 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The submission cover image, drawn from the account's own curve.
+"""The submission cover image, drawn from the account's own marks.
 
 A cover made of stock artwork would say nothing about the project. This
-one is the real equity and balance series out of docs/snapshot.json - the
+one is the open mark of every instrument out of docs/snapshot.json - the
 same file the live sheet reads - so the picture on the submission is the
 picture of the account. If the snapshot cannot be read the run FAILS
-rather than falling back to a decorative curve: a fabricated line on the
-cover of a project whose whole argument is measurement would be the worst
-possible thing to ship.
+rather than falling back to decoration: a fabricated chart on the cover of
+a project whose whole argument is measurement would be the worst possible
+thing to ship.
+
+It draws marks rather than the equity curve because the curve, cut back to
+levels that survive their checks, currently holds three points. Three
+points make a flat line with a cliff on it, which reads as a rendering
+fault rather than as a result. 25 bars are the same data honestly.
 
 Usage:
     python tools_cover.py --snapshot docs/snapshot.json --out docs/cover.png
@@ -47,6 +52,7 @@ SURFACE = (20, 25, 34)
 INK = (232, 236, 242)
 MUTED = (138, 148, 165)
 RULE = (36, 44, 56)
+RULE_STRONG = (51, 61, 76)
 ACCENT = (138, 166, 239)
 EQUITY = (46, 95, 191)
 EQUITY_LIT = (110, 150, 235)
@@ -69,55 +75,45 @@ def build(snapshot: dict, width: int = 1200, height: int = 630) -> Image.Image:
     img = Image.new("RGB", (width, height), GROUND)
     d = ImageDraw.Draw(img)
 
-    curve = snapshot["curve"]
-    if len(curve) < 2:
-        raise SystemExit(f"curve has {len(curve)} points - nothing to draw")
+    rows = snapshot["instruments"]
+    if not rows:
+        raise SystemExit("the snapshot holds no instruments - nothing to draw")
 
-    # --- the chart, bled across the lower two thirds --------------------
-    top, bottom = 300, height - 96
-    left, right = 0, width
-    eq = series(curve, "equity")
-    bal = series(curve, "balance")
-    lo = min(min(eq), min(bal))
-    hi = max(max(eq), max(bal))
-    span = (hi - lo) or 1.0
-    # A little headroom so neither line touches an edge.
-    lo, hi = lo - span * 0.12, hi + span * 0.12
-    span = hi - lo
-
-    def xy(values):
-        n = len(values) - 1
-        return [(left + (right - left) * i / n,
-                 bottom - (v - lo) / span * (bottom - top))
-                for i, v in enumerate(values)]
-
-    start = float(snapshot["start_equity"])
-    y_start = bottom - (start - lo) / span * (bottom - top)
-    d.line([(0, y_start), (width, y_start)], fill=RULE, width=2)
-
-    eq_pts = xy(eq)
-    # The area under equity, so the line reads as a body rather than a wire.
-    d.polygon([(0, bottom)] + eq_pts + [(width, bottom)], fill=(17, 24, 38))
-    d.line(xy(bal), fill=BALANCE, width=3, joint="curve")
-    d.line(eq_pts, fill=EQUITY_LIT, width=4, joint="curve")
-    d.ellipse([eq_pts[-1][0] - 7, eq_pts[-1][1] - 7,
-               eq_pts[-1][0] + 7, eq_pts[-1][1] + 7], fill=EQUITY_LIT)
-
-    # --- the header, on a solid band so type never sits on the curve ----
-    d.rectangle([0, 0, width, 300], fill=GROUND)
-    d.line([(0, 300), (width, 300)], fill=RULE, width=1)
-
-    d.text((64, 58), "KANGAROO OPTIONS", font=font("georgiab.ttf", 62),
+    # --- the header, on its own band -----------------------------------
+    d.text((64, 54), "KANGAROO OPTIONS", font=font("georgiab.ttf", 62),
            fill=INK)
-    d.text((64, 138),
+    d.text((64, 134),
            "An options credit-spread grid that trades 25 instruments",
            font=font("georgia.ttf", 27), fill=MUTED)
-    d.text((64, 176),
+    d.text((64, 172),
            "and asks a model one question: how much, if any?",
            font=font("georgiai.ttf", 27), fill=ACCENT)
-
-    d.text((64, 240), "ALPACA AI TRADING AGENTS HACKATHON  ·  2026",
+    d.text((64, 232), "ALPACA AI TRADING AGENTS HACKATHON  ·  2026",
            font=font("consolab.ttf", 19), fill=MUTED)
+    d.line([(64, 272), (width - 64, 272)], fill=RULE, width=1)
+
+    # --- one bar per instrument, at its mark ----------------------------
+    top, bottom = 300, height - 132
+    mid = (top + bottom) / 2
+    marks = sorted((float(r["unrealized"]) for r in rows), reverse=True)
+    scale = max(abs(m) for m in marks) or 1.0
+    half = (bottom - top) / 2 - 6
+
+    left, right = 64, width - 64
+    slot = (right - left) / len(marks)
+    bar = max(6.0, slot * 0.62)
+    d.line([(left, mid), (right, mid)], fill=RULE_STRONG, width=1)
+    for i, m in enumerate(marks):
+        x = left + slot * (i + 0.5)
+        h = abs(m) / scale * half
+        y0, y1 = (mid - h, mid) if m >= 0 else (mid, mid + h)
+        d.rectangle([x - bar / 2, y0, x + bar / 2, y1],
+                    fill=GAIN if m >= 0 else LOSS)
+
+    d.text((left, top - 24),
+           f"OPEN MARK PER INSTRUMENT  ·  {len(marks)} GRIDS  ·  "
+           f"BEST {marks[0]:+,.0f}   WORST {marks[-1]:+,.0f}",
+           font=font("consolab.ttf", 14), fill=MUTED)
 
     # --- the strip of measured numbers ----------------------------------
     pl = float(snapshot["pl_total"])
@@ -125,22 +121,24 @@ def build(snapshot: dict, width: int = 1200, height: int = 630) -> Image.Image:
     cells = [
         ("EQUITY", f"{float(snapshot['equity']):,.0f}", INK),
         ("P&L", f"{pl:+,.0f}", tone),
-        ("INSTRUMENTS", f"{int(snapshot['instruments_open'])}", INK),
+        ("REALIZED", f"{float(snapshot['realized']):+,.0f}", INK),
         ("FILLS", f"{int(snapshot['fills'])}", INK),
         ("RESIDUAL", f"{float(snapshot['residual']):+.4f}", ACCENT),
     ]
-    y = height - 74
-    d.rectangle([0, y - 14, width, height], fill=SURFACE)
-    d.line([(0, y - 14), (width, y - 14)], fill=RULE, width=1)
+    y = height - 96
+    d.rectangle([0, y - 16, width, height], fill=SURFACE)
+    d.line([(0, y - 16), (width, y - 16)], fill=RULE, width=1)
     x = 64
     for label, value, colour in cells:
         d.text((x, y), label, font=font("consolab.ttf", 13), fill=MUTED)
-        d.text((x, y + 20), value, font=font("consolab.ttf", 27), fill=colour)
-        x += 224
+        d.text((x, y + 22), value, font=font("consolab.ttf", 28), fill=colour)
+        x += 216
 
     stamp = str(snapshot["as_of"])[:16].replace("T", " ")
-    d.text((width - 64, y + 26), f"as of {stamp} ET",
-           font=font("consola.ttf", 15), fill=MUTED, anchor="rs")
+    d.text((width - 64, height - 22),
+           f"every figure read back through the Alpaca CLI  ·  "
+           f"as of {stamp} ET",
+           font=font("consola.ttf", 14), fill=MUTED, anchor="rs")
     return img
 
 
