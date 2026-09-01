@@ -291,7 +291,7 @@ def build(snap: dict, out: str, cover: str | None) -> None:
     d.heading(s, "alpaca implementation",
               "One binary, structured JSON, auditable from a log")
     d.bullets(s, 2.35, [
-        ("CLI only.", "`alpaca`, pinned to v0.0.13. Not an SDK, not raw "
+        ("CLI only.", "the alpaca binary, pinned to v0.0.13. Not an SDK, not raw "
                       "HTTP. Positions, clock, quotes, chains, orders, "
                       "fills, portfolio history, account activities."),
         ("Multi-leg limit orders.", "order_class mleg with a NEGATIVE limit "
