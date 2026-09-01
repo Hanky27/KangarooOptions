@@ -110,11 +110,21 @@ distinguishable after the fact.
 21 of the project's 83 tests cover this file alone, and every one of them
 assumes the model misbehaves.
 
-> **Status, honestly:** the gate ships `enabled: false` and is switched on
-> per config once an API key is installed on the host. Turning it on
-> changes what a running grid does with live positions, so it is a dated
-> decision rather than a default. The startup banner says which of the two
-> a given run was, and so do the counters.
+> **Live since 2026-09-01, 19:42 CEST**, on `claude-sonnet-5`. Its first
+> decision on the competition account, from the agent log:
+>
+> ```
+> GOOGL_long: RISK GATE [model] 2 -> 1 (10124 ms): Multiple clusters
+> (AMZN, TSLA, GLD, SLV) already breached 5% adverse simultaneously;
+> reduce to conserve shared margin.
+> ```
+>
+> It halved the size and named four OTHER instruments to justify it -
+> which is the whole argument for putting a model here rather than a
+> threshold. The gate still ships `enabled: false` in the example config:
+> turning it on changes what a running grid does with live positions, so
+> it is a dated decision rather than a default, and the startup banner
+> says which of the two a given run was.
 
 ## The Alpaca implementation
 

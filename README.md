@@ -81,8 +81,12 @@ wing the account already held, a strike the rebuy would have netted
 against, and a close the broker filled while the process was being
 stopped.
 
-Day two added two more, and neither was in the agent - it traded
-correctly through both. They were in what this project SAYS about itself:
+Day two added three more. Two were not in the agent at all - it traded
+correctly through both - and the third stopped it dead: the account
+crossed 100 open option contracts, the batched quote request hit an
+endpoint limit of exactly 100, and 25 grids went unmanaged for 93 minutes
+while the watchdog restarted a process that died the same way every two
+minutes. They were in what this project SAYS about itself:
 a fee rate that had gone stale, and an equity series that was not this
 account. The second one was on the public page for eighteen hours and
 nothing in its output said so, which is why the report now refuses to

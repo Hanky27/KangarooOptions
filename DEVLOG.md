@@ -386,6 +386,80 @@ broker booked, `fees_provisional` is what cash has been charged beyond it,
 and the second is bounded by the provisional rate on the contracts traded
 since the newest booking. Outside that bound the run still aborts.
 
+### `8a84e63` — the batch had no size, and the grid outgrew it
+
+**Symptom.** The agent printed its startup banner, died before the first
+poll, was restarted by the watchdog two minutes later, and died the same
+way. From **18:03 to 19:36 CEST** — 93 minutes, with the market open, 25
+grids holding open positions, nothing closing and nothing managed. The log
+held 46 identical startup banners and not one error line.
+
+**Cause**, in the broker's own words, from the request that killed it:
+
+```
+{"error": "symbol limit is 100", "status": 400,
+ "path": ".../v1beta1/options/quotes/latest?symbols=AAPL260902C00312500%2C..."}
+```
+
+The account crossed **100 open option contracts** at 18:03. Every poll
+after that asked for 102 symbols in one request, and the endpoint refused
+ALL of it — no partial result — so `market_data()` raised before the first
+instrument was stepped.
+
+Batching option quotes is what makes the poll cost near-constant in the
+instrument count instead of linear, and it stays. What was missing is that
+a batch has a size, and that the size is a property of the endpoint rather
+than of the grid.
+
+**Fix.** `QUOTE_SYMBOL_LIMIT = 100`, and both quote calls split their
+symbol list into request-sized pieces and merge the answers. The constant
+is 100 because the endpoint says so in the error text, not because it
+seemed round.
+
+**Confirmed against the live account**, not only a stub: 102 open legs in,
+102 quotes back, none missing. Two regression tests cover the split at 102
+and the boundary at exactly 100.
+
+**What this one is really about.** Every other defect in this log was
+found by looking at a number that was wrong. This one was found by
+noticing that a machine which had been asked to run for a week had stopped
+answering — and it had been silent for an hour and a half before anybody
+asked. The agent's own log could not say so, because the failure happened
+before the part of the run that writes anything.
+
+### `4426150`, `8d139b6` — the model, live
+
+The gate went on at 19:42 CEST on `claude-sonnet-5`, after the three
+candidates were measured against the real account with the real view:
+
+| model | latency | answer to a request of 3 |
+|---|---|---|
+| `claude-opus-5` | 6.56 s | 1 |
+| `claude-sonnet-5` | 4.03 s | 1 |
+| `claude-haiku-4-5` | 1.42 s | 0 |
+
+The first attempt at that measurement failed on my own defect rather than
+theirs: `max_tokens` was 200, two of three answers came back cut — one
+mid-JSON (`{"qty": 1, "reason`), one empty — and both were logged as
+unusable. It is 1024 now.
+
+Its first decision on the competition account:
+
+```
+GOOGL_long: RISK GATE [model] 2 -> 1 (10124 ms): Multiple clusters
+(AMZN, TSLA, GLD, SLV) already breached 5% adverse simultaneously;
+reduce to conserve shared margin.
+```
+
+It halved the size and justified it by naming four OTHER instruments —
+which is the entire argument for a model in this position rather than a
+threshold. `KangarooCore` sees its own legs and nothing else.
+
+Note the 10.1 seconds against the 4.03 measured earlier: the live view
+carries all 25 clusters and the model reasoned longer over it. That is why
+a poll spends at most three consults — 3 x 10 s is a bound the loop can
+carry, 25 x 10 s is not.
+
 ### Why neither said anything
 
 The job runs every five minutes in a window nobody reads, and its log was
