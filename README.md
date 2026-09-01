@@ -28,6 +28,31 @@ A martingale-style grid trading agent on US options, built for the
 It is a deliberately stripped-down port of the author's cTrader
 "Kangaroo" V2.2 Forex grid bot.
 
+## Live performance
+
+**<https://hanky27.github.io/KangarooOptions/>**
+
+The competition account, republished every five minutes by a scheduled
+task running `deploy/publish_perf.ps1` while the agent trades. It is not
+a dashboard the agent writes to: every figure on it is read back out of
+the broker through the same Alpaca CLI the agent places orders with, and
+the terms are measured independently of each other.
+
+That independence is the point. Realized P&L is rebuilt by matching every
+fill against the contract it closes at average cost, fees are summed from
+the account's own `FEE` bookings, unrealized comes from the position
+marks - and
+
+    equity - start = realized + unrealized - fees + transfers
+
+has to hold to the cent or the page is not published at all. (Cash paid
+in before the first fill is starting capital and sits inside `start`;
+only a transfer AFTER trading began appears in that last term, and a
+booking the report cannot classify as either stops it by name.) The equity
+curve is checked the same way, against a second reading of the same
+account, before it is drawn. Both checks exist because both terms were
+caught being wrong: see `8717fff` in [DEVLOG.md](DEVLOG.md).
+
 ## Hackathon submission
 
 Alpaca AI Trading Agents Hackathon (lablab.ai), 28 August - 4 September
@@ -49,9 +74,19 @@ The hackathon is judged on the robustness of the agent workflow as well as
 on P&L, so every change made to the agent WHILE it traded the competition
 account is recorded in **[DEVLOG.md](DEVLOG.md)** - the symptom that was
 measured, the cause with its evidence, the fix, and the measurement that
-confirmed it. Two defects were found and fixed live on day one; both were
+confirmed it. Four defects were found and fixed live on day one, all
 invisible to the backtest because they live in the execution path, which
-the simulator does not exercise.
+the simulator does not exercise: an order id that had to be unique, a
+wing the account already held, a strike the rebuy would have netted
+against, and a close the broker filled while the process was being
+stopped.
+
+Day two added two more, and neither was in the agent - it traded
+correctly through both. They were in what this project SAYS about itself:
+a fee rate that had gone stale, and an equity series that was not this
+account. The second one was on the public page for eighteen hours and
+nothing in its output said so, which is why the report now refuses to
+draw a curve it has not checked against a second reading.
 
 Deployment to the running agent goes through
 `deploy/update_and_restart.ps1`, which waits for the observed change at
