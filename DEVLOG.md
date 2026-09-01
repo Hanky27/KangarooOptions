@@ -314,22 +314,77 @@ Measured one parameter at a time:
 | `--pnl-reset no_reset` | identical output — excluded |
 | `1D/1H` | +100,000.00 at every shared timestamp |
 | `2D/5Min` | first point correct, later ones inflated |
-| `5D/5Min`, `1W/5Min` | agree with `5D/1H` and with `account get` |
+| `5D/5Min`, `1W/5Min` | agreed with `5D/1H` and with `account get` (and stopped agreeing six hours later) |
 | `1M/1D` | 99,105.88 — `last_equity` to the cent |
 
 Periods of 5D and longer read the account correctly; 1D and 2D do not.
 
-**Fix.** `fetch_curve` takes 5D/5Min and refuses to draw it until it
-agrees with a second series at every shared timestamp and with
-`last_equity` at the previous close. Points from before the account
-existed are dropped — the broker reports those as equity 0, and a zero in
-the curve is a 100 % drawdown in the drawdown line, the same defect
-wearing a different hat. The tolerance is 1 % of starting capital: the
-measured spread between two resolutions of the same true series is at
-most 111 USD on 99,000, and the defect it has to catch is 100,000.
+**First fix, and why it was not enough.** `fetch_curve` took 5D/5Min —
+the series that agreed with the account that morning — and refused to draw
+it unless it matched a second series and `last_equity`. Curve confirmed
+starting at 100,000, maximum drawdown -2,145.12.
 
-**Confirmed.** Curve starts at 100,000 at Monday 09:30 ET; maximum
-drawdown -2,145.12.
+**Six hours later the same check fired, in the opposite direction.** With
+the market open, `5D/1H` had become the inflated one and `1D/5Min` the
+clean one:
+
+| query | base_value_asof | account existed then | result |
+|---|---|---|---|
+| Monday window | 2026-08-28 | no | +100,000 |
+| Tuesday window | 2026-08-31 | yes | clean |
+| `1D` pre-market | 2026-08-28 | no | +100,000 |
+| `1D` market open | 2026-08-31 | yes | clean |
+| `5D/1H` | 2026-08-27 | no | +100,000 |
+| `1M/1D` | 2026-08-27 | no | **clean** |
+
+An INTRADAY series whose baseline predates the funding comes back inflated
+by it; the daily series does not. **No fixed (period, timeframe) is safe**,
+which is the real lesson: a rule picked because it matched this morning is
+a coin that has landed heads once.
+
+**Second fix, and the one that stands.** The daily series is the SPINE, and
+it is verified against `last_equity` before anything is built on it. Each
+day's intraday window is then admitted only if it lands on that day's spine
+value; Monday — the funding day — does not, and contributes its single
+close instead of a line 100,000 too high. Today has no close yet, so it
+gets two checks instead: its baseline must equal yesterday's verified
+close, and its newest bar must be within 1 % of the account as it stands.
+Every refusal is published under `curve_rejected_days` with the numbers
+that caused it, so a reader sees the check happen rather than being told
+it did.
+
+**Today's bars failed that check too.** Measured 12:24 ET:
+
+```
+account.equity                    90,321.33
+cash + sum(market_value)          90,455.33   <- agrees within 134.00
+newest 5Min history bar (12:20)   95,595.88   <- 5,274.55 above both
+the 12:15 bar, read twice         95,911.88, then 94,950.88
+```
+
+The intraday history is not the same quantity as the account's own equity
+while the day is open, and the broker revises it as it goes. So today
+contributes one point — the live one, from cash and the position marks. A
+straight line from yesterday's verified close says less than a shape would,
+and every level on it is one the account actually held.
+
+**`start_equity` stopped coming from the endpoint** at the same time. It is
+now the sum of the account's own cash transfers booked before the first
+fill: 100,000.00, which is also what the competition requires the account
+to start at. `base_value` was never that number — it was whatever baseline
+the query happened to pick, and it was measured naming a date on which this
+account did not exist.
+
+**A third term appeared while fixing the second.** With the market open the
+identity was short by 4.55 on 492 contracts. Every one of the account's 299
+non-trade bookings carried date 2026-08-31; today had none. Contracts
+traded since the newest booked fee: 182. 182 x 0.025 = 4.55, exactly. Cash
+is charged a provisional 0.025 per contract the instant a fill happens and
+the settled bookings replace it after the close — which for Monday came to
+15.12, not 7.75. The report now carries both terms: `fees` is what the
+broker booked, `fees_provisional` is what cash has been charged beyond it,
+and the second is bounded by the provisional rate on the contracts traded
+since the newest booking. Outside that bound the run still aborts.
 
 ### Why neither said anything
 

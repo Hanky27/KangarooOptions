@@ -1088,7 +1088,9 @@ Do not edit docs/index.html - it is the output, this file is the source.
       var terms = [
         { k: "Realized", v: D.realized, note: "closed spreads, matched fill by fill" },
         { k: "Unrealized", v: D.unrealized, note: D.open_spreads + " spreads still open, at the mark" },
-        { k: "Fees", v: -D.fees, note: (D.fee_bookings || 0) + " bookings read from the account" }
+        { k: "Fees", v: -(D.fees + (D.fees_provisional || 0)),
+          note: (D.fee_bookings || 0) + " booked" +
+                (D.fees_provisional ? " + " + D.fees_provisional.toFixed(2) + " not yet booked" : "") }
       ];
 
       el("terms").innerHTML =

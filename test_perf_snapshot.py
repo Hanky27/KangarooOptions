@@ -28,8 +28,10 @@ account data behind them, not from invented numbers.
 import pytest
 
 from alpaca_cli import AlpacaCliError
-from tools_perf_snapshot import (fee_timeline, fetch_curve, realized_by_contract,
-                                 split_activities)
+import datetime as dt
+
+from tools_perf_snapshot import (daily_spine, fee_timeline, fetch_curve, funding,
+                                 realized_by_contract, split_activities)
 
 # The account's own bookings, in the shape and the order the CLI returned
 # them: OCC clearing at -0.03 and -0.05 through the session, then the four
@@ -123,96 +125,173 @@ def test_realized_carries_no_fees_any_more():
 # --- the curve ----------------------------------------------------------
 
 ACCOUNT = {"created_at": "2026-08-31T06:12:32.878183Z",
-           "last_equity": "99105.88"}
+           "last_equity": "99105.88", "equity": "90951.33"}
+CLOCK = {"timestamp": "2026-09-01T12:25:00-04:00"}
 
-# Thursday and Friday, before the account existed: the broker reports the
-# equity of an account that was not there as 0. Monday is the live day.
-BEFORE = [1787836200, 1787922600]
-MONDAY = [1788183000, 1788186600, 1788204600, 1788206400]
+ET = dt.timezone(dt.timedelta(hours=-4))
 
 
-def _series(base, timestamps, equities):
-    return {"base_value": base,
-            "base_value_asof": "2026-08-27",
-            "timestamp": list(timestamps),
-            "equity": list(equities),
-            "profit_loss": [e - float(base) for e in equities]}
+def at(stamp: str) -> int:
+    """Epoch seconds for a market-time stamp.
+
+    Computed rather than written out: fetch_curve buckets points into days
+    with exactly this conversion, and a hand-typed epoch that lands on the
+    wrong side of a boundary would make these tests pass or fail for a
+    reason that has nothing to do with the code.
+    """
+    return int(dt.datetime.fromisoformat(stamp).replace(tzinfo=ET).timestamp())
 
 
-class CurveCli:
-    """Answers the two portfolio queries fetch_curve makes."""
+# The daily series stamps a close at 20:00 ET; intraday bars sit inside
+# the 09:30-16:00 window the per-day query asks for.
+THU_CLOSE = at("2026-08-27T20:00:00")
+FRI_CLOSE = at("2026-08-28T20:00:00")
+MON_CLOSE = at("2026-08-31T20:00:00")
+FRI_BARS = [(at("2026-08-28T09:30:00"), 100000.0),
+            (at("2026-08-28T16:00:00"), 100000.0)]
+MON_BARS = [(at("2026-08-31T09:30:00"), 200000.0),
+            (at("2026-08-31T16:00:00"), 199130.16)]
+TUE_BARS = [(at("2026-09-01T09:30:00"), 98593.88),
+            (at("2026-09-01T12:20:00"), 95437.88)]
 
-    def __init__(self, five_min, one_hour):
-        self.five_min = five_min
-        self.one_hour = one_hour
+
+class SpineCli:
+    """Answers the three shapes of query fetch_curve makes."""
+
+    def __init__(self, daily, per_day, base_value="99105.88"):
+        self.daily = daily
+        self.per_day = per_day
+        self.base_value = base_value
+        self.asked = []
 
     def _run(self, args):
-        return self.five_min if "5Min" in args else self.one_hour
+        self.asked.append(list(args))
+        if "--period" in args and args[args.index("--period") + 1] == "1M":
+            return self.daily
+        if "--period" in args and args[args.index("--period") + 1] == "1D":
+            bars = self.per_day.get("2026-09-01", [])
+            return {"base_value": self.base_value,
+                    "timestamp": [t for t, _ in bars],
+                    "equity": [e for _, e in bars]}
+        day = args[args.index("--start") + 1][:10]
+        bars = self.per_day.get(day, [])
+        return {"base_value": self.base_value,
+                "timestamp": [t for t, _ in bars],
+                "equity": [e for _, e in bars]}
 
 
-def test_a_curve_that_is_not_this_account_is_refused():
-    """Measured 2026-09-01: `--period 1D --timeframe 5Min` returned
-    200,000 for the open of a day the account started at 100,000, and
-    199,130.16 for its close against the broker's own last_equity of
-    99,105.88. The published page drew a flat line at ~199,000 and a max
-    drawdown of -102,137.75 that never happened. Nothing in the output
-    said so, which is why the series is checked against a second one."""
-    inflated = _series("100000", MONDAY,
-                       [200000.0, 199624.94, 199097.40, 199130.16])
-    honest = _series("100000", MONDAY,
-                     [100000.0, 99624.94, 99097.40, 99130.16])
+def _daily(points):
+    return {"timestamp": [t for t, _ in points],
+            "equity": [e for _, e in points]}
+
+
+SPINE = _daily([(THU_CLOSE, 0.0), (FRI_CLOSE, 100000.0),
+                (MON_CLOSE, 99105.88)])
+
+
+def test_the_spine_must_be_the_account_the_broker_reports():
+    """The daily series was the only query that read this account
+    correctly in every measurement. It is still not trusted on that
+    record: its newest close has to equal last_equity, which is the same
+    number arriving by a different route."""
+    wrong = _daily([(FRI_CLOSE, 100000.0), (MON_CLOSE, 91000.0)])
     with pytest.raises(AlpacaCliError) as err:
-        fetch_curve(CurveCli(inflated, honest), ACCOUNT)
-    assert "100,000.00" in str(err.value), str(err.value)
-
-
-def test_the_two_resolutions_may_differ_by_the_marks_they_sample():
-    """5Min and 1H bars are sampled at different instants, so they never
-    agree to the cent. Measured spread on the live account: at most 111
-    USD on 99,000. The check has to pass that and still catch 100,000."""
-    fine = _series("100000", MONDAY,
-                   [100000.0, 99624.94, 99097.40, 99130.16])
-    coarse = _series("100000", MONDAY,
-                     [100000.0, 99613.94, 99097.40, 99019.16])
-    history, checks = fetch_curve(CurveCli(fine, coarse), ACCOUNT)
-    assert checks["curve_vs_control"] == 111.0
-    assert checks["curve_tolerance"] == 1000.0
-
-
-def test_points_from_before_the_account_existed_are_dropped():
-    """The broker reports them as equity 0. Left in, a zero is a 100 %
-    drawdown in the drawdown line - the same defect in a second guise."""
-    stamps = BEFORE + MONDAY
-    equities = [0.0, 0.0, 100000.0, 99624.94, 99097.40, 99130.16]
-    series = _series("100000", stamps, equities)
-    history, _checks = fetch_curve(CurveCli(series, series), ACCOUNT)
-    assert history["timestamp"] == MONDAY
-    assert 0.0 not in history["equity"]
-    assert len(history["equity"]) == len(history["profit_loss"]) == 4
-
-
-def test_the_previous_close_is_checked_against_the_brokers_own_figure():
-    """A second, independent anchor: whatever the curve says yesterday
-    closed at has to be what the account says it closed at."""
-    tuesday = [1788269400, 1788271200]
-    stamps = MONDAY + tuesday
-    good = _series("100000", stamps,
-                   [100000.0, 99624.94, 99097.40, 99105.88, 98900.0, 97854.88])
-    history, checks = fetch_curve(CurveCli(good, good), ACCOUNT)
-    assert checks["curve_vs_last_equity"] == 0.0
-    assert history["timestamp"] == stamps
-
-    bad = _series("100000", stamps,
-                  [100000.0, 99624.94, 99097.40, 92000.0, 98900.0, 97854.88])
-    with pytest.raises(AlpacaCliError) as err:
-        fetch_curve(CurveCli(bad, bad), ACCOUNT)
+        daily_spine(SpineCli(wrong, {}), ACCOUNT)
     assert "last_equity" in str(err.value)
+    assert "91,000.00" in str(err.value)
 
 
-def test_the_first_day_has_no_previous_close_to_check():
-    """None, not a false pass: on the account's first day the second
-    anchor does not exist yet and the report says so."""
-    only_monday = _series("100000", MONDAY,
-                          [100000.0, 99624.94, 99097.40, 99130.16])
-    _history, checks = fetch_curve(CurveCli(only_monday, only_monday), ACCOUNT)
-    assert checks["curve_vs_last_equity"] is None
+def test_days_before_the_account_existed_are_dropped_from_the_spine():
+    """The broker reports them as equity 0, and a zero in the curve is a
+    100 % drawdown in the drawdown line."""
+    spine = daily_spine(SpineCli(SPINE, {}), ACCOUNT)
+    assert [t for t, _ in spine] == [FRI_CLOSE, MON_CLOSE]
+    assert 0.0 not in [e for _, e in spine]
+
+
+def test_the_funding_days_intraday_line_is_refused_and_named():
+    """Measured 2026-09-01: the window over Monday - the day the account
+    was funded - returned 200,000.00 for an open the account held 100,000
+    at, and 199,130.16 for a close the broker reports as 99,105.88. That
+    line was published for eighteen hours. It contributes its daily close
+    instead, and the refusal is recorded rather than silently applied."""
+    cli = SpineCli(SPINE, {"2026-08-28": FRI_BARS, "2026-08-31": MON_BARS})
+    points, checks = fetch_curve(cli, ACCOUNT, CLOCK)
+    assert "2026-08-31" not in checks["intraday_days"]
+    assert "2026-08-28" in checks["intraday_days"]
+    refused = [r for r in checks["rejected_days"] if r["day"] == "2026-08-31"]
+    assert refused and refused[0]["intraday_close"] == 199130.16
+    assert refused[0]["daily_close"] == 99105.88
+    assert 199130.16 not in [e for _, e in points]
+    assert (MON_CLOSE, 99105.88) in points
+
+
+def test_a_day_that_lands_on_its_close_keeps_its_shape():
+    cli = SpineCli(SPINE, {"2026-08-28": FRI_BARS})
+    points, checks = fetch_curve(cli, ACCOUNT, CLOCK)
+    assert checks["intraday_days"] == ["2026-08-28"]
+    for stamp, value in FRI_BARS:
+        assert (stamp, value) in points
+
+
+def test_todays_bars_are_refused_when_they_disagree_with_the_account():
+    """Today has no close to check against. Measured at 12:24 ET: the
+    newest 5Min bar read 95,595.88 while the account reported 90,321.33
+    and cash+marks agreed with the account to within 134.00 - and the
+    12:15 bar was revised down by 961 between two reads. Drawing those
+    would put the line 5,000 above the headline and end it in a cliff."""
+    cli = SpineCli(SPINE, {"2026-08-28": FRI_BARS, "2026-09-01": TUE_BARS})
+    points, checks = fetch_curve(cli, ACCOUNT, CLOCK)
+    assert "2026-09-01" not in checks["intraday_days"]
+    refused = [r for r in checks["rejected_days"] if r["day"] == "2026-09-01"]
+    assert refused, checks["rejected_days"]
+    assert refused[0]["gap"] == round(95437.88 - 90951.33, 2)
+    assert refused[0]["allowed"] == round(90951.33 * 0.01, 2)
+    assert 95437.88 not in [e for _, e in points]
+
+
+def test_todays_bars_are_kept_when_they_are_merely_lagging():
+    """The check is about lag, not about truth: the newest bar is minutes
+    old and the account is now, so a normal gap has to pass."""
+    close_enough = [(at("2026-09-01T09:30:00"), 98593.88),
+                    (at("2026-09-01T12:20:00"), 91100.0)]
+    cli = SpineCli(SPINE,
+                   {"2026-08-28": FRI_BARS, "2026-09-01": close_enough})
+    _points, checks = fetch_curve(cli, ACCOUNT, CLOCK)
+    assert "2026-09-01" in checks["intraday_days"]
+    assert not [r for r in checks["rejected_days"]
+                if r["day"] == "2026-09-01"]
+
+
+def test_todays_bars_are_refused_when_the_baseline_is_not_yesterdays_close():
+    cli = SpineCli(SPINE, {"2026-08-28": FRI_BARS,
+                           "2026-09-01": [(at("2026-09-01T12:20:00"),
+                                           91100.0)]},
+                   base_value="100000")
+    _points, checks = fetch_curve(cli, ACCOUNT, CLOCK)
+    assert "2026-09-01" not in checks["intraday_days"]
+
+
+# --- starting capital ---------------------------------------------------
+
+def test_starting_capital_is_read_from_the_accounts_own_funding():
+    """Not from base_value: that is whichever baseline the history
+    endpoint picked, and it was measured naming 2026-08-27, a date on
+    which this account did not exist."""
+    first_fill = int(dt.datetime.fromisoformat(
+        "2026-08-31T13:40:20+00:00").timestamp())
+    transfers = [{"net_amount": "100000",
+                  "created_at": "2026-08-31T06:13:40.396198Z"}]
+    assert funding(transfers, first_fill) == 100000.0
+
+
+def test_money_moved_after_trading_began_is_not_starting_capital():
+    """It is not performance either - the identity carries it as its own
+    term so it can never be read as profit."""
+    first_fill = int(dt.datetime.fromisoformat(
+        "2026-08-31T13:40:20+00:00").timestamp())
+    transfers = [{"net_amount": "100000",
+                  "created_at": "2026-08-31T06:13:40.396198Z"},
+                 {"net_amount": "25000",
+                  "created_at": "2026-09-01T15:00:00.000000Z"}]
+    assert funding(transfers, first_fill) == 100000.0
