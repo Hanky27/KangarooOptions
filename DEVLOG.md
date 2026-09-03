@@ -720,11 +720,11 @@ not have found them first; it can keep them from coming back.
 
 ---
 
-## Thursday: eight defects, and how each one was hidden
+## Thursday: nine defects, and how each one was hidden
 
 The account's first assignment weekend arrived on Wednesday night, and by
 Thursday morning nothing about the system was quite what it claimed. Five
-defects in the agent, three in the reporting, and every single one had a
+defects in the agent, four in the reporting, and every single one had a
 reason it had stayed invisible.
 
 ### 1. The fix for the last defect deleted a method
@@ -906,7 +906,7 @@ task reports `rc=0` where it had reported `rc=1` for 36 hours.
 ## What Thursday has in common with Monday
 
 Monday's lesson was that a number nobody checks is a number nobody can
-trust. Thursday's is narrower and worse: **every one of these eight was
+trust. Thursday's is narrower and worse: **every one of these nine was
 invisible in exactly the place someone would have looked.**
 
 The deleted method was in the diff, as a line count. The workstation path

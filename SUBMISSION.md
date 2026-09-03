@@ -107,7 +107,7 @@ a silent, untested strategy change while live positions are open. The
 counters keep *"the gate agreed"* and *"the gate was down"*
 distinguishable after the fact.
 
-21 of the project's 83 tests cover this file alone, and every one of them
+22 of the project's 107 tests cover this file alone, and every one of them
 assumes the model misbehaves.
 
 > **Live since 2026-09-01, 19:42 CEST**, on `claude-sonnet-5`. Its first
@@ -197,7 +197,7 @@ peaks in the middle, QQQ is flat to worse, on 3–16 clusters each. It is in
 the log as a non-finding, because the SPY column alone would have made a
 good slide.
 
-**Fifteen defects were found and fixed while it traded live**, eight of
+**Seventeen defects were found and fixed while it traded live**, nine of
 them on the final Thursday alone, when the account's first assignments
 arrived. Each is in [DEVLOG.md](DEVLOG.md) with the measurement that found
 it and the regression test that covers it. Six were not in the agent at
@@ -206,7 +206,7 @@ drawdown of −102,137.75 on the public page that had never happened; one
 was a fix of mine that silently deleted the method the whole report ran
 on, visible in its own diff as 39 insertions against 54 deletions.
 
-The Thursday eight share a shape worth naming, because it is the actual
+The Thursday nine share a shape worth naming, because it is the actual
 lesson of this project: **each was invisible in exactly the place someone
 would have looked.** A deleted method that only shows up as a line count.
 A hardcoded workstation path inside the module every test replaced. A

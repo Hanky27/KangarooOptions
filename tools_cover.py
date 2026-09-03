@@ -75,9 +75,15 @@ def build(snapshot: dict, width: int = 1200, height: int = 630) -> Image.Image:
     img = Image.new("RGB", (width, height), GROUND)
     d = ImageDraw.Draw(img)
 
-    rows = snapshot["instruments"]
+    # GRIDS only. Since the first assignments (2026-09-02) the snapshot's
+    # instrument list also carries rows of SHARES the account was handed
+    # when a short leg was exercised against it - AMZN -100 at +933, GLD
+    # +100 at +348. Drawing those as bars would put four positions nobody
+    # opened into a picture of the grid, and their marks are large enough
+    # to set the scale for everything else.
+    rows = [r for r in snapshot["instruments"] if not r.get("assigned")]
     if not rows:
-        raise SystemExit("the snapshot holds no instruments - nothing to draw")
+        raise SystemExit("the snapshot holds no grid rows - nothing to draw")
 
     # --- the header, on its own band -----------------------------------
     d.text((64, 54), "KANGAROO OPTIONS", font=font("georgiab.ttf", 62),
@@ -111,7 +117,11 @@ def build(snapshot: dict, width: int = 1200, height: int = 630) -> Image.Image:
                     fill=GAIN if m >= 0 else LOSS)
 
     d.text((left, top - 24),
-           f"OPEN MARK PER INSTRUMENT  ·  {len(marks)} GRIDS  ·  "
+           # "25 instruments" above and "21 grids" here are both true and
+           # read as a contradiction side by side: 25 is what the agent
+           # runs, 21 is how many are holding a position right now. Say
+           # which, rather than leaving a reader to reconcile two numbers.
+           f"OPEN MARK PER INSTRUMENT  ·  {len(marks)} OF 25 HOLDING  ·  "
            f"BEST {marks[0]:+,.0f}   WORST {marks[-1]:+,.0f}",
            font=font("consolab.ttf", 14), fill=MUTED)
 

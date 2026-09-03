@@ -21,7 +21,7 @@
 
 """The submission slide deck, with its numbers read from the snapshot.
 
-11 slides. The one that matters most is not the strategy or the model -
+12 slides. The one that matters most is not the strategy or the model -
 it is what happened when the same simulator was asked to pay the spread
 it had never been charged.
 
@@ -340,9 +340,9 @@ def build(snap: dict, out: str, cover: str | None) -> None:
              "That is why every level is now checked against a second "
              "reading before it is drawn.", 15, MUTED, SERIF, False)])
 
-    # 8 -- what broke ------------------------------------------------------
+    # 8 -- what broke, the first week --------------------------------------
     s = d.slide()
-    d.heading(s, "devlog", "Seven defects, each with its measurement")
+    d.heading(s, "devlog", "Seventeen defects, each with its measurement")
     d.code(s, 2.35, [
         "f9b7bc0  client_order_id must be unique          6 instruments, every poll",
         "ad109a5  wing selection diverged from the sim    TLT halted at 20/20",
@@ -351,16 +351,47 @@ def build(snap: dict, out: str, cover: str | None) -> None:
         "8717fff  fees modelled, not read                 15.12 booked vs 7.75 assumed",
         "8717fff  the curve was not this account          -102,137.75 drawdown, 18 h public",
         "8a84e63  the batch had no size                   102 legs > limit 100, 93 min down",
+        "32977da  a guard that fired only at the cap      500 rows returned, 831 exist",
     ], size=12)
-    d.bullets(s, 4.75, [
+    d.bullets(s, 5.0, [
         ("Every fix carries a regression test", "built from the account "
-                                                "data behind it. 93 tests."),
-        ("The worst one was not a wrong number", "— it was 93 minutes of a "
-                                                 "trading agent silently "
-                                                 "not trading."),
+                                                "data behind it. 107 tests."),
+        ("The worst was not a wrong number", "— it was 93 minutes of a "
+                                             "trading agent silently not "
+                                             "trading. Nine more arrived "
+                                             "on the last day; next slide."),
     ], size=16, gap=0.66)
 
-    # 9 -- the finding ------------------------------------------------------
+    # 9 -- the assignment day ----------------------------------------------
+    s = d.slide()
+    d.heading(s, "the last morning",
+              "Nine more, and each was invisible where you would look")
+    d.code(s, 2.2, [
+        "an anchor-to-anchor cut deleted activities()   39 insertions, 54 deletions",
+        "a live path read C:/Users/.../env.txt          4 of 25 instruments halted",
+        "assignment deadlocked its own instrument       halt -> never reaches the gate",
+        "one shared snapshot, two directions            both would have bought 100 AMZN",
+        "the BROKER closed legs with its own ids        3 fills at 19:45:07Z, not ours",
+        "an assignment's premium counted twice          identity 927.00 out, to the cent",
+        "today's bars asked for before the open         start cannot be after end: 400",
+        "a CDN edge served a two-day-old snapshot       curl 07:09, the page 09-01",
+        "the publish task ran in C:\\Windows\\System32     WinError 5 every five minutes",
+    ], size=12, colour=INK)
+    d.bullets(s, 5.15, [
+        ("None was found by reading code.", "Each was found by asking the "
+                                            "account a question and "
+                                            "comparing the answer to what "
+                                            "the code assumed."),
+        ("And one of my own explanations was wrong.", "The fix I proposed "
+                                                      "for the premium made "
+                                                      "the gap worse, 373 to "
+                                                      "567 — so the "
+                                                      "experiment refuted "
+                                                      "me, and the log says "
+                                                      "so."),
+    ], size=16, gap=0.78)
+
+    # 10 -- the finding ------------------------------------------------------
     s = d.slide()
     d.heading(s, "what the measuring found",
               "The backtest never paid the bid/ask")
@@ -385,7 +416,7 @@ def build(snap: dict, out: str, cover: str | None) -> None:
                                      "killed them."),
     ], size=16, gap=0.72)
 
-    # 10 -- honest ---------------------------------------------------------
+    # 11 -- honest ---------------------------------------------------------
     s = d.slide()
     d.heading(s, "what is honest about this",
               "The parts that are not finished")
@@ -411,7 +442,7 @@ def build(snap: dict, out: str, cover: str | None) -> None:
         ("residual", f"{float(snap['residual']):+.4f}", ACCENT),
     ], size=22)
 
-    # 11 -- close ----------------------------------------------------------
+    # 12 -- close ----------------------------------------------------------
     s = d.slide()
     if cover:
         try:
@@ -438,7 +469,7 @@ def main() -> int:
     with open(args.snapshot, "r", encoding="utf-8") as fh:
         snap = json.load(fh)
     build(snap, args.out, args.cover)
-    print(f"{args.out}  (11 slides, snapshot as of {snap['as_of']})")
+    print(f"{args.out}  (12 slides, snapshot as of {snap['as_of']})")
     return 0
 
 

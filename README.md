@@ -74,23 +74,39 @@ The hackathon is judged on the robustness of the agent workflow as well as
 on P&L, so every change made to the agent WHILE it traded the competition
 account is recorded in **[DEVLOG.md](DEVLOG.md)** - the symptom that was
 measured, the cause with its evidence, the fix, and the measurement that
-confirmed it. Four defects were found and fixed live on day one, all
-invisible to the backtest because they live in the execution path, which
-the simulator does not exercise: an order id that had to be unique, a
-wing the account already held, a strike the rebuy would have netted
-against, and a close the broker filled while the process was being
-stopped.
+confirmed it.
 
-Day two added three more. Two were not in the agent at all - it traded
-correctly through both - and the third stopped it dead: the account
-crossed 100 open option contracts, the batched quote request hit an
+**Seventeen defects, nine of them on the last morning.** Four were found
+on day one, all invisible to the backtest because they live in the
+execution path a simulator never runs: an order id that had to be unique,
+a wing the account already held, a strike a rebuy would have netted
+against, and a close the broker filled while the process was being
+stopped. Day two added three, one of which stopped the agent dead - the
+account crossed 100 open contracts, the batched quote request hit an
 endpoint limit of exactly 100, and 25 grids went unmanaged for 93 minutes
 while the watchdog restarted a process that died the same way every two
-minutes. They were in what this project SAYS about itself:
-a fee rate that had gone stale, and an equity series that was not this
-account. The second one was on the public page for eighteen hours and
-nothing in its output said so, which is why the report now refuses to
-draw a curve it has not checked against a second reading.
+minutes.
+
+The last morning, after the account's first assignments, added nine more,
+and they share a shape worth naming: **each was invisible in exactly the
+place someone would have looked.** A fix of mine that deleted the method
+the whole report ran on, visible in its own diff only as 39 insertions
+against 54 deletions. A hardcoded workstation path inside the one module
+every test replaced. A deadlock that needed two individually correct
+behaviours to meet. A double-flatten that needed an assignment and an open
+market on the same day, which had never happened. Orders the BROKER placed
+on this account, indistinguishable from ours until you read the id. A
+premium counted on both sides of an identity that still balanced, because
+a bounded tolerance absorbed it. And a failure that existed only when the
+scheduled task ran, never when the same command was typed by hand.
+
+Six of the seventeen were not in the agent at all - it traded correctly
+through every one of them. They were in what this project SAYS about
+itself, and one put a maximum drawdown of -102,137.75 on the public page
+for eighteen hours with nothing in the output to say so. That is why the
+report now refuses to draw a curve it has not checked against a second
+reading, and why `test_cli_contract.py` reads the source rather than
+calling it.
 
 Deployment to the running agent goes through
 `deploy/update_and_restart.ps1`, which waits for the observed change at
@@ -246,7 +262,21 @@ one purpose.
 | `agent.py` | Poll loop: expiry/assignment gates -> clock -> underlying quote -> close check -> rebuy check. |
 | `backtest_underlying.py` | Stage-1 edge check on the underlying itself (upper bound). |
 | `backtest_options.py` | Stage-2 backtests with real Alpaca option prices (3 styles, 4 regimes). |
-| `test_kangaroo_core.py` | Self-tests of the core (`python test_kangaroo_core.py`). |
+| `risk_gate.py` | The model's only entry point. Returns an integer between zero and what was asked; anything else is a broken contract. |
+| `tools_perf_snapshot.py` | Measures the account through the same CLI and refuses to write a snapshot whose terms do not add up. |
+| `perf_page.tpl.html` | Source of the live sheet. `docs/index.html` is its OUTPUT — edit the template. |
+| `tools_deck.py`, `tools_cover.py` | Deck and cover image, every figure read from `docs/snapshot.json`. |
+
+**Tests — 107, `python -m pytest`**
+
+| File | What it holds against |
+|---|---|
+| `test_kangaroo_core.py` | The pure state machine (also runs standalone). |
+| `test_agent_sunk_pot.py` | Expiry accounting, the loader's halt bookkeeping, quote batching, order paging. |
+| `test_risk_gate.py` | 22 tests, every one assuming the model misbehaves. |
+| `test_perf_snapshot.py` | The reporting maths, fee timeline and curve checks. |
+| `test_assignment_recovery.py` | The assignment deadlock, the shared-snapshot double-flatten, and legs the BROKER closed with its own order ids. |
+| `test_cli_contract.py` | Reads the SOURCE, not the code: every `cli.<name>(` must exist on `AlpacaCli`, and nothing reachable from `agent.py` may hardcode an absolute path. Both defects it covers passed 93 tests, because every test replaced the boundary that was broken. |
 
 All broker access goes through **Alpaca's CLI** (hackathon requirement:
 MCP server or CLI - no raw API calls). Spreads are multi-leg LIMIT day
@@ -264,11 +294,18 @@ no retries, no fallbacks.
   `(width - credit) * 100` per contract; margin per leg is the spread
   width, not the strike.
 - **Assignment gate:** an assigned stock position in the underlying is
-  flattened immediately (no wheel).
+  flattened immediately (no wheel), at startup as well as in the poll
+  loop, and the shared position snapshot is updated the moment it fills -
+  otherwise both directions of one underlying act on the same stale row
+  and the account ends up long a stock nobody chose.
 - **No cancel-all:** only ID-based order handling.
 - **Crash-safe state:** cluster state is persisted atomically to
   `state_file` and reconciled against the account's real positions
-  (short leg AND wing) at startup; any mismatch aborts.
+  (short leg AND wing) at startup. A mismatch aborts that instrument -
+  with exactly two evidenced exceptions, both taken from the BROKER's own
+  records rather than from the state file: a leg it booked as expired,
+  assigned or exercised while the resulting stock is still held, and a leg
+  it closed itself with its own order id. Anything else still halts.
 
 ## Setup
 
@@ -277,7 +314,8 @@ no retries, no fallbacks.
 2. `pip install pyyaml`
 3. `copy config.example.yaml config.yaml` and set `cli_path`
    (plus `env_file`, or export `ALPACA_API_KEY` / `ALPACA_SECRET_KEY`).
-4. Self-tests: `python test_kangaroo_core.py`
+4. Tests: `python -m pytest` (107) - or `python test_kangaroo_core.py`
+   for the core alone, without pytest installed
 5. Single decision pass without any order: `python agent.py --once --dry-run`
 6. Run: `python agent.py`
 
