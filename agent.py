@@ -119,18 +119,33 @@ def _foreign_fill(orders: list[dict], symbol: str, side: str) -> float | None:
 
     The LAST fill wins: a symbol can be traded more than once, and the exit
     that matters is the one that took the position away.
+
+    Both shapes are searched. The broker also closes a whole spread in ONE
+    multi-leg order, and those carry order_class "mleg" with symbol null at
+    the top level and the real symbols inside `legs` - measured the same
+    minute, f4d852c1-..., 2 legs, SPY260902C00766000 sell_to_close at 0.35
+    within a 4.13 net. Reading only the top level would have found the two
+    simple orders and silently missed that one.
     """
     price = None
     for o in orders:
-        if o.get("status") != "filled" or o.get("symbol") != symbol:
-            continue
-        if str(o.get("side")) != side:
+        if o.get("status") != "filled":
             continue
         if str(o.get("client_order_id") or "").startswith("kang_"):
             continue
-        got = o.get("filled_avg_price")
-        if got is not None:
-            price = float(got)
+        if o.get("symbol") == symbol and str(o.get("side")) == side:
+            got = o.get("filled_avg_price")
+            if got is not None:
+                price = float(got)
+            continue
+        for leg in (o.get("legs") or []):
+            if leg.get("symbol") != symbol or str(leg.get("side")) != side:
+                continue
+            if leg.get("status") != "filled":
+                continue
+            got = leg.get("filled_avg_price")
+            if got is not None:
+                price = float(got)
     return price
 
 # Keys the loader supplies once for the whole run; an instrument config may

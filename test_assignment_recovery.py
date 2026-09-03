@@ -162,6 +162,31 @@ def _broker_buy(symbol, price):
             "client_order_id": "6e8b6bab-7b07-4b10-99a1-ae934195b32f"}
 
 
+def test_a_broker_close_sent_as_one_multi_leg_order_is_found():
+    """The shape the top-level read would have missed.
+
+    Measured 2026-09-02 19:45:07Z, order f4d852c1-...: order_class "mleg",
+    symbol null at the top, both real symbols inside `legs`, a 4.13 net
+    made of a 0.35 sell_to_close on the wing and the buy on the short leg.
+    """
+    cli = StubCli(is_open=False, timestamp="2026-09-03T05:00:00-04:00",
+                  positions=[{"symbol": "GLD", "qty": "100", "side": "long"}])
+    a = _gld_agent(cli)
+    mleg = {"status": "filled", "symbol": None, "order_class": "mleg",
+            "filled_avg_price": "4.13",
+            "client_order_id": "f4d852c1-c265-4286-b264-9b3f394b1b95",
+            "legs": [
+                {"symbol": GLD_SHORT, "side": "buy", "status": "filled",
+                 "filled_avg_price": "0.02"},
+                {"symbol": GLD_WING, "side": "sell", "status": "filled",
+                 "filled_avg_price": "0.05"},
+            ]}
+    positions = {p["symbol"]: p for p in cli.positions()}
+    assert a.book_broker_closes(positions, [mleg], {}) == 1
+    # (0.51 - (0.02 - 0.05)) * 100 - the wing was SOLD, not left to expire
+    assert abs(a.core.sunk_pot - 54.00) < 1e-9, a.core.sunk_pot
+
+
 def test_the_broker_closing_a_leg_is_booked_from_its_own_fill():
     """GLD_long as the account actually held it on 2026-09-03.
 
