@@ -107,6 +107,32 @@ from kangaroo_core import KangarooCore, settlement_pnl
 TERMINAL_BAD = {"canceled", "expired", "rejected", "done_for_day",
                 "stopped", "suspended", "replaced"}
 
+
+def _foreign_fill(orders: list[dict], symbol: str, side: str) -> float | None:
+    """Price of a FILLED order on `symbol`/`side` that this agent did not send.
+
+    Every order of ours carries a client_order_id starting with `kang_`, so
+    anything else on our own positions came from the broker - Alpaca's paper
+    engine closes short options by itself near expiry. Measured 2026-09-02:
+    two such fills at 19:45:07Z, order_class "simple", the option symbol at
+    the top level rather than in `legs`.
+
+    The LAST fill wins: a symbol can be traded more than once, and the exit
+    that matters is the one that took the position away.
+    """
+    price = None
+    for o in orders:
+        if o.get("status") != "filled" or o.get("symbol") != symbol:
+            continue
+        if str(o.get("side")) != side:
+            continue
+        if str(o.get("client_order_id") or "").startswith("kang_"):
+            continue
+        got = o.get("filled_avg_price")
+        if got is not None:
+            price = float(got)
+    return price
+
 # Keys the loader supplies once for the whole run; an instrument config may
 # not override them because they describe the PROCESS, not the grid.
 PROCESS_KEYS = ("cli_path", "env_file", "poll_seconds", "poll_fill_seconds",
@@ -406,7 +432,79 @@ class Instrument:
             f"{self.core.cluster_id}.")
         return True
 
-    def reconcile(self, positions: dict, settled: set[str] | None = None) -> None:
+    def book_broker_closes(self, positions: dict, orders: list[dict],
+                           settled: dict[str, set[str]] | None = None) -> int:
+        """Book legs the BROKER closed with its own orders, not ours.
+
+        Measured on the competition account 2026-09-02 at 19:45:07Z, fifteen
+        minutes before the close: two filled market BUYs on GLD_long's short
+        puts that this agent never submitted - client_order_id
+        6e8b6bab-...  and a8349f27-..., broker UUIDs, not the
+        `kang_<instrument>_c<cluster>_l<leg>_<kind>` scheme every order of
+        ours carries. recover_unbooked_close could not see them: it matches
+        on OUR prefix, and it only ends a cluster when EVERY leg is gone.
+        This was three legs of four. So GLD_long halted with a leg the
+        account no longer held, 100 assigned GLD shares nobody was managing
+        and a live 399 put expiring that day.
+
+        Nothing here is estimated. A leg is booked only when both exits are
+        evidenced:
+          - the short leg by a FILLED buy at a price the broker reports,
+          - the wing either by a FILLED sell, or by the broker's own OPEXP
+            row, which is what an expiry worth nothing looks like (one worth
+            something is exercised and books OPEXC instead).
+        Anything else is left exactly where it is, and reconcile halts the
+        instrument as before. An assigned short leg (OPASN) is not touched:
+        that is handle_expiries' deferral, settled once the stock is flat.
+
+        Returns the number of legs booked.
+        """
+        settled = settled or {}
+        booked = 0
+        for leg in list(self.core.legs):
+            occ = leg.option_symbol
+            extra = self.leg_extras.get(occ) or {}
+            wing = extra.get("wing_occ")
+            if occ in positions or not wing:
+                continue
+            if "OPASN" in settled.get(occ, set()):
+                continue                      # assignment: not ours to book
+            short_exit = _foreign_fill(orders, occ, "buy")
+            if short_exit is None:
+                continue                      # no evidence - reconcile decides
+            if wing in positions:
+                raise AlpacaCliError(
+                    f"{self.name}: the broker closed short leg {occ} but the "
+                    f"wing {wing} is still held - half a spread is not a "
+                    f"state this agent can book; refusing to guess")
+            wing_exit = _foreign_fill(orders, wing, "sell")
+            if wing_exit is None:
+                if "OPEXP" not in settled.get(wing, set()):
+                    raise AlpacaCliError(
+                        f"{self.name}: short leg {occ} was bought back at "
+                        f"{short_exit} but there is no fill and no expiry "
+                        f"record for the wing {wing} - refusing to book a "
+                        f"spread whose second leg is unaccounted for")
+                wing_exit = 0.0
+            pnl = ((leg.entry_premium - (short_exit - wing_exit))
+                   * self.core.contract_multiplier * leg.qty)
+            self.core.book_settled(pnl)
+            self.core.legs.remove(leg)
+            booked += 1
+            self.say(f"BROKER CLOSED leg {occ} x{leg.qty}: bought back at "
+                     f"{short_exit:.2f}, wing {wing} at {wing_exit:.2f} "
+                     f"against a {leg.entry_premium:.2f} credit -> "
+                     f"{pnl:+.2f} USD booked into cluster "
+                     f"{self.core.cluster_id} (pot {self.core.sunk_pot:+.2f})")
+        if booked:
+            self.leg_extras = {
+                k: v for k, v in self.leg_extras.items()
+                if any(l.option_symbol == k for l in self.core.legs)}
+            self.save_state()
+        return booked
+
+    def reconcile(self, positions: dict,
+                  settled: "set[str] | dict[str, set[str]] | None" = None) -> None:
         """Every spread leg in the state must exist in the account: the
         short put as a short position, the wing as a long position, each
         with at least the leg's quantity. Any mismatch aborts. `positions`
@@ -1018,14 +1116,27 @@ class KangarooAgent:
         oldest = min((x["expiry"] for i in self.instruments
                       if not i.halted for x in i.leg_extras.values()),
                      default=None)
-        settled: set[str] = set()
+        # symbol -> the booking types the broker recorded for it. The TYPE
+        # matters: OPASN is a deferred settlement handle_expiries owns,
+        # while OPEXP is proof that a long wing expired worth nothing (one
+        # worth something books OPEXC instead).
+        settled: dict[str, set[str]] = {}
         if oldest:
             rows = self.cli.activities(after=oldest)
-            settled = {r["symbol"] for r in rows
-                       if r.get("activity_type") in OPTION_SETTLEMENT_TYPES
-                       and r.get("symbol")}
+            for r in rows:
+                if r.get("activity_type") in OPTION_SETTLEMENT_TYPES \
+                        and r.get("symbol"):
+                    settled.setdefault(r["symbol"], set()).add(r["activity_type"])
             log(f"broker settled {len(settled)} option symbol(s) since "
                 f"{oldest} (expiry, assignment or exercise)")
+        # recent_orders covers TODAY, because a close this agent failed to
+        # book can only have happened while it was running. A close the
+        # BROKER made needs the same window as the settlements: it happens
+        # near expiry, which is days before the restart that has to explain
+        # the missing leg. Measured: the GLD buy-backs were 2026-09-02
+        # 19:45Z and a today-only query cannot see them.
+        settle_orders = (self.cli.orders_since(oldest) if oldest
+                         else recent_orders)
         for inst in self.instruments:
             # Startup is where a RESTART fails: a state file that no longer
             # matches the account stops the instrument it belongs to, not
@@ -1051,6 +1162,10 @@ class KangarooAgent:
                 # a close it filled while this agent was being stopped is
                 # not a mismatch, it is a cluster that ended.
                 inst.recover_unbooked_close(positions, recent_orders)
+                # ...and before reconcile, because a leg the BROKER bought
+                # back is gone from the account for a reason that can be
+                # evidenced, not a state file that drifted.
+                inst.book_broker_closes(positions, settle_orders, settled)
                 inst.reconcile(positions, settled)
             except Exception:                                # noqa: BLE001
                 inst.halted = True

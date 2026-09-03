@@ -154,6 +154,9 @@ class StubInstrument:
     def recover_unbooked_close(self, positions, orders):
         return False
 
+    def book_broker_closes(self, positions, orders, settled=None):
+        return 0
+
     def reconcile(self, positions, settled=None):
         pass
 

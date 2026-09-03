@@ -70,7 +70,13 @@ class FlatteningCli(StubCli):
 
 
 def _gld_agent(cli):
-    a = make_agent(cli, legs=[(GLD_SHORT, 1, 1.20, 401.0, 396.0, "2026-09-02")])
+    """GLD_long's first leg exactly as the account opened it.
+
+    2026-08-31 13:40:32Z, one order: sell GLD260902P00401000 at 0.87, buy
+    GLD260902P00396000 at 0.36 - a net credit of 0.51, which is what the
+    state file carries as entry_premium.
+    """
+    a = make_agent(cli, legs=[(GLD_SHORT, 1, 0.51, 401.0, 396.0, "2026-09-02")])
     a.underlying = "GLD"
     return a
 
@@ -147,6 +153,92 @@ def test_the_flatten_unblocks_the_settlement_in_the_same_pass():
     a.assignment_gate(positions)
     a.handle_expiries("2026-09-05", positions)
     assert a.core.legs == [], "and settled once it is gone"
+
+
+def _broker_buy(symbol, price):
+    """A fill the BROKER made: a UUID client_order_id, not our scheme."""
+    return {"status": "filled", "symbol": symbol, "side": "buy",
+            "filled_avg_price": str(price), "order_class": "simple",
+            "client_order_id": "6e8b6bab-7b07-4b10-99a1-ae934195b32f"}
+
+
+def test_the_broker_closing_a_leg_is_booked_from_its_own_fill():
+    """GLD_long as the account actually held it on 2026-09-03.
+
+    Opened 401/396 for a 0.51 net credit. The broker bought the 401 back at
+    0.02 at 19:45:07Z on expiry day and the 396 wing expired worthless, so
+    the spread realized (0.51 - 0.02) * 100 = +49.00. Every number here is
+    from the account: the fill price from the order, the worthless wing
+    from the broker's own OPEXP row.
+    """
+    cli = StubCli(is_open=False, timestamp="2026-09-03T05:00:00-04:00",
+                  positions=[{"symbol": "GLD", "qty": "100", "side": "long"}])
+    a = _gld_agent(cli)
+    positions = {p["symbol"]: p for p in cli.positions()}
+    orders = [_broker_buy(GLD_SHORT, 0.02)]
+    settled = {GLD_WING: {"OPEXP"}}
+
+    assert a.book_broker_closes(positions, orders, settled) == 1
+    assert a.core.legs == [], a.core.legs
+    assert abs(a.core.sunk_pot - 49.00) < 1e-9, a.core.sunk_pot
+    # and the state is now consistent with the account
+    a.reconcile(positions, settled)
+
+
+def test_an_assigned_leg_is_left_to_the_settlement_path():
+    """OPASN is handle_expiries' business, not this one's."""
+    cli = StubCli(is_open=False, timestamp="2026-09-03T05:00:00-04:00",
+                  positions=[{"symbol": "GLD", "qty": "100", "side": "long"}])
+    a = _gld_agent(cli)
+    positions = {p["symbol"]: p for p in cli.positions()}
+    orders = [_broker_buy(GLD_SHORT, 0.02)]
+    assert a.book_broker_closes(positions, orders,
+                                {GLD_SHORT: {"OPASN"}}) == 0
+    assert len(a.core.legs) == 1, "an assignment settles once the stock is flat"
+    assert a.core.sunk_pot == 0.0
+
+
+def test_our_own_close_is_not_mistaken_for_the_brokers():
+    """A `kang_` order is ours; recover_unbooked_close owns those."""
+    cli = StubCli(is_open=False, timestamp="2026-09-03T05:00:00-04:00",
+                  positions=[{"symbol": "GLD", "qty": "100", "side": "long"}])
+    a = _gld_agent(cli)
+    ours = dict(_broker_buy(GLD_SHORT, 0.02),
+                client_order_id="kang_GLD_long_c1_l2_x_1788206147317")
+    assert a.book_broker_closes(
+        {p["symbol"]: p for p in cli.positions()}, [ours], {}) == 0
+    assert len(a.core.legs) == 1
+
+
+def test_a_wing_with_no_record_refuses_to_be_booked():
+    """No fill and no expiry row for the wing: the spread is unaccounted for."""
+    cli = StubCli(is_open=False, timestamp="2026-09-03T05:00:00-04:00",
+                  positions=[{"symbol": "GLD", "qty": "100", "side": "long"}])
+    a = _gld_agent(cli)
+    try:
+        a.book_broker_closes({p["symbol"]: p for p in cli.positions()},
+                             [_broker_buy(GLD_SHORT, 0.02)], {})
+    except AlpacaCliError as exc:
+        assert "unaccounted for" in str(exc), exc
+    else:
+        raise AssertionError("a half-evidenced spread must not be booked")
+    assert a.core.sunk_pot == 0.0
+
+
+def test_a_wing_still_held_refuses_to_be_booked():
+    """Half a spread is not a state that can be valued."""
+    cli = StubCli(is_open=False, timestamp="2026-09-03T05:00:00-04:00",
+                  positions=[{"symbol": "GLD", "qty": "100", "side": "long"},
+                             {"symbol": GLD_WING, "qty": "1", "side": "long"}])
+    a = _gld_agent(cli)
+    try:
+        a.book_broker_closes({p["symbol"]: p for p in cli.positions()},
+                             [_broker_buy(GLD_SHORT, 0.02)],
+                             {GLD_WING: {"OPEXP"}})
+    except AlpacaCliError as exc:
+        assert "half a spread" in str(exc), exc
+    else:
+        raise AssertionError("a naked short leg must not be booked as a spread")
 
 
 if __name__ == "__main__":
