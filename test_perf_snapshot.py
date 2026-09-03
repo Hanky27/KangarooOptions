@@ -116,10 +116,15 @@ def test_realized_carries_no_fees_any_more():
         {"symbol": "SPY260904P00770000", "qty": "1", "side": "buy",
          "price": "1.00", "transaction_time": "2026-08-31T14:40:20+00:00"},
     ]
-    realized, _per, closed, events = realized_by_contract(fills)
+    realized, _per, closed, events, book = realized_by_contract(fills)
     assert round(realized, 2) == 100.0
     assert closed == 1
     assert all("fees" not in e for e in events), events
+    # The book comes out of the SAME pass, because unrealized is now
+    # measured against it rather than against the broker's own
+    # avg_entry_price - two costs for one position is how 3.00 of SLV
+    # premium ended up hiding in the provisional fee term.
+    assert book == {}, "the position closed, so nothing is left open"
 
 
 # --- the curve ----------------------------------------------------------

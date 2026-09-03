@@ -758,6 +758,8 @@ Do not edit docs/index.html - it is the output, this file is the source.
       <h3>How it is measured</h3>
       <p>Positions, fills, cash and the clock come from <code>alpaca</code>, the broker's own CLI. Realized P&amp;L is rebuilt by matching every fill against the contract it closes, at average cost &mdash; not taken from a field.</p>
       <p>Fees are read from the account's own bookings &mdash; every <code>FEE</code> activity the broker recorded, summed &mdash; not from a rate. An earlier version of this page assumed the OCC clearing fee of <code>0.025</code> per contract and was right until the regulatory charges settled after the first close, at which point it was short by <code>7.37</code>.</p>
+      <p id="assignNote"></p>
+      <p id="driftNote"></p>
     </div>
     <div>
       <h3>What this is not</h3>
@@ -1040,6 +1042,24 @@ Do not edit docs/index.html - it is the output, this file is the source.
         var barStyle = r.unrealized < 0
           ? "right:50%;width:" + w + "%;background:var(--loss);"
           : "left:50%;width:" + w + "%;background:var(--gain);";
+        // Shares an assignment left behind. Not a spread, not a leg, and
+        // no credit: they are what the account was handed when a short
+        // option was exercised against it, and the agent flattens them on
+        // the next open poll. Showing them as "0.5 spreads" of a put grid
+        // would be the page inventing a position nobody holds.
+        if (r.assigned) {
+          return "<tr>" +
+            '<td class="sym">' + r.underlying +
+              '<span class="side">assigned</span></td>' +
+            "<td>" + r.shares + " sh</td>" +
+            "<td>&mdash;</td>" +
+            "<td>" + usd2.format(r.market_value) + "</td>" +
+            '<td class="' + cls(r.unrealized) + '">' + signed(r.unrealized, 2) + "</td>" +
+            '<td class="bar-cell"><div class="bar-track">' +
+              (r.unrealized === 0 ? "" : '<div class="bar" style="' + barStyle + '"></div>') +
+            "</div></td>" +
+          "</tr>";
+        }
         return "<tr>" +
           '<td class="sym">' + r.underlying +
             '<span class="side">' + (r.direction === "long" ? "put" : "call") + "</span></td>" +
@@ -1054,7 +1074,12 @@ Do not edit docs/index.html - it is the output, this file is the source.
       }).join("");
 
       el("foot").innerHTML =
-        "<tr><td>" + rows.length + " instruments</td>" +
+        // 21 grids and 4 rows of assigned shares are not "25
+        // instruments" - the shares are what a grid was handed, not
+        // one it runs.
+        "<tr><td>" + D.instruments_open + " grids" +
+          (D.assigned_rows ? " + " + D.assigned_rows + " assigned" : "") +
+        "</td>" +
         "<td>" + D.open_spreads + "</td>" +
         "<td>" + usd2.format(rows.reduce(function (s, r) { return s + r.credit_open; }, 0)) + "</td>" +
         "<td>" + usd2.format(-D.market_value) + "</td>" +
@@ -1134,13 +1159,50 @@ Do not edit docs/index.html - it is the output, this file is the source.
 
       el("ledgerNote").textContent =
         "One row per (symbol, direction). Credit held is what the spreads were sold for; " +
-        "mark is what it costs to buy them back right now.";
+        "mark is what it costs to buy them back right now." +
+        (D.assigned_rows
+          ? " " + D.assigned_rows + " row" + (D.assigned_rows === 1 ? "" : "s") +
+            " marked “assigned” are shares, not spreads — what a short leg" +
+            " exercised against this account left behind."
+          : "");
 
-      var longs = D.instruments.filter(function (r) { return r.direction === "long"; }).length;
+      // An option that expires or is assigned produces no closing fill, so
+      // its whole life has to be rebuilt from the broker's own bookings.
+      // Saying so here, because it is the part of the reconstruction that
+      // is easiest to get quietly wrong.
+      el("assignNote").innerHTML = !D.assigned_rows ? "" :
+        "An assignment leaves no fill behind. The option simply stops existing and shares " +
+        "take its place, so the broker&rsquo;s <code>OPEXP</code>, <code>OPASN</code>, " +
+        "<code>OPEXC</code> and <code>OPTRD</code> bookings are replayed as the fills that " +
+        "never arrived &mdash; paired by the <code>group_id</code> the broker sets on both " +
+        "halves of one event. A short leg assigned folds the premium it was sold for into the " +
+        "share cost; a long leg exercised realizes the premium it cost and leaves the shares " +
+        "at the strike. Counting either one the other way put the same money on both sides of " +
+        "the identity and left it <code>927.00</code> out.";
+
+      el("driftNote").innerHTML = !(D.basis_drift && D.basis_drift.length) ? "" :
+        "Where the broker&rsquo;s own <code>avg_entry_price</code> disagrees with the cost " +
+        "rebuilt here, the difference is shown rather than absorbed: " +
+        D.basis_drift.map(function (d) {
+          return "<b>" + d.symbol + "</b> " + d.ours + " against " + d.broker +
+                 " (" + signed(d.usd, 2) + ")";
+        }).join(", ") + ". Ours is the cash that actually moved &mdash; for SLV, six orders " +
+        "received <code>597.00</code> of premium where the broker&rsquo;s basis folds in " +
+        "<code>600.00</code> &mdash; so the identity is measured on ours, and this line says " +
+        "by how much the two views differ.";
+
+      // GRIDS only. The assigned rows are shares, and counting them as
+      // bearish grids selling calls would describe four positions the
+      // agent never opened.
+      var grids = D.instruments.filter(function (r) { return !r.assigned; });
+      var longs = grids.filter(function (r) { return r.direction === "long"; }).length;
       el("whatTrades").textContent =
-        longs + " bullish grids selling put spreads and " + (D.instruments.length - longs) +
+        longs + " bullish grids selling put spreads and " + (grids.length - longs) +
         " bearish grids selling call spreads, each rebuying on a move against it and closing the " +
-        "whole cluster on aggregate profit. No signal, no model in the loop — a grid.";
+        "whole cluster on aggregate profit. No entry signal — the grid is always in. The model " +
+        "never opens or enlarges one: on a rebuy that matters it sees the whole account and " +
+        "answers how much of the requested size survives, clamped in code between zero and what " +
+        "was asked.";
 
       renderLedger();
       drawChart();

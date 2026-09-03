@@ -100,12 +100,9 @@ TRANSFER_TYPES = {"JNLC", "JNLS", "CSD", "CSW"}
 #
 # They still have to reach the books, because there is no closing FILL for
 # any of them: an option sold for a credit and then assigned leaves that
-# credit in cash with nothing on the other side of the identity. So each
-# becomes a synthetic close at price 0 - which is exactly what happened, an
-# expiry worth nothing or an intrinsic handed over to the share position -
-# and each OPTRD becomes the share trade that received it, at the strike
-# the broker booked. The stock's own cost basis is then that same strike,
-# which is what its unrealized_pl is measured against.
+# credit in cash with nothing on the other side of the identity. Each
+# becomes a synthetic fill - see synthetic_fills for how the premium is
+# placed, which is NOT the same for an assignment as for an exercise.
 OPTION_SETTLEMENT_TYPES = {"OPEXP", "OPASN", "OPEXC"}
 STOCK_TRADE_TYPES = {"OPTRD"}
 
@@ -170,41 +167,54 @@ def synthetic_fills(rows: list[dict]) -> list[dict]:
     Two shapes come out of here, both in the same dict shape fetch_all_fills
     returns so they can be merged into one time-ordered list:
 
-    * the option, closed at 0. `qty` in these rows carries the sign of the
-      side being closed - measured over all 21 rows: +1 where a SHORT was
-      taken away (IWM260901C00293000, the short call of the 293/298 spread)
-      and -1 where a LONG was (IWM260901C00298000, its wing). So a positive
-      qty is a buy-to-close and a negative one a sell-to-close.
-    * the shares, at the strike. OPTRD carries the underlying, the share
-      count and the strike it changed hands at - GLD 100 at 405, AMZN -100
-      at 257.5 - and its own sign says which way: shares received are a
-      buy, shares delivered a sell.
+    * the option, closed. `qty` in these rows carries the sign of the side
+      being closed - measured over all 21 rows: +1 where a SHORT was taken
+      away (IWM260901C00293000, the short call of the 293/298 spread) and
+      -1 where a LONG was (IWM260901C00298000, its wing). So a positive qty
+      is a buy-to-close and a negative one a sell-to-close. At WHAT price
+      is the part that took two attempts to get right - see below.
+    * the shares. OPTRD carries the underlying, the share count and the
+      strike they changed hands at - GLD 100 at 405, AMZN -100 at 257.5 -
+      and its own sign says which way: shares received are a buy, shares
+      delivered a sell.
 
     An expiry worth nothing IS a close at zero, and one that stands alone
     (no OPTRD in its group) is exactly that.
 
-    AN ASSIGNMENT IS NOT. The broker does not realize the premium and then
-    buy the shares at the strike - it FOLDS the premium into the share
-    basis and realizes nothing on the option. Measured 2026-09-03 against
-    avg_entry_price on the three positions still open:
+    AN ASSIGNMENT IS NOT, AND AN EXERCISE IS NOT THE SAME AS AN ASSIGNMENT.
+    The cash is identical in both - `net_amount` is the strike times the
+    shares, exactly, in every one of the eleven rows. What differs is where
+    the PREMIUM ends up, and the broker's own avg_entry_price says which:
 
-        GLD  strike 405     broker basis 402.330   premium 2.670
-        SLV  strike 59.875  broker basis  59.125   premium 0.750
-        TLT  strike 82.5    broker basis  81.900   premium 0.600
+        GLD  strike 405     basis 402.330   assigned  -> premium in basis
+        SLV  strike 59.875  basis  59.125   assigned  -> premium in basis
+        TLT  strike 82.5    basis  81.900   assigned  -> premium in basis
+        AMZN strike 265     basis 265.000   exercised -> basis IS the strike
 
-    Closing the option at zero instead put the premium on BOTH sides - our
-    realized and, through avg_entry_price, the broker's unrealized - and
-    the identity came up 927.00 short, to the cent the sum of those three
-    differences. So the option closes at its own book average (realizing
-    nothing) and the shares carry the premium:
+    A SHORT option taken away (OPASN) folds the premium you RECEIVED into
+    the share basis and realizes nothing on the option. A LONG option
+    exercised (OPEXC) realizes the premium you PAID as a loss and leaves
+    the basis at the strike. Both readings of the account agree on which is
+    which: every OPASN row carries a positive qty and every OPEXC a
+    negative one, which is only what the words mean - you are assigned on
+    what you are short, and your own longs are what get exercised.
 
-        share price = strike + basis_sign * premium
+    So, per group:
 
-    with basis_sign = -short_sign * direction: short_sign +1 when a SHORT
-    was taken away, -1 for a LONG; direction +1 when shares were received,
-    -1 when delivered. All four combinations are in this account - short
-    put assigned, short call assigned, long call exercised, long put
-    exercised - and the three open ones reproduce the broker's basis.
+        short taken away   option closes at BOOK (realizes 0)
+                           shares at strike + basis_sign * premium
+        long exercised     option closes at ZERO (realizes -premium)
+                           shares at the strike
+
+    with basis_sign = -direction, direction being +1 when shares were
+    received and -1 when delivered.
+
+    Both halves have to move together. Closing at zero AND buying at the
+    strike counts the premium twice - the identity came up 927.00 short, to
+    the cent the sum of the three assigned differences above. Closing at
+    book AND buying at the strike loses it entirely - tried, and it made
+    the gap worse, 373.00 to 567.00. The pair above is the only combination
+    that reproduces the broker's basis on every position it still holds.
 
     The option and its shares are paired by GROUP_ID, which the broker sets
     on exactly the two rows of one event (measured: 21 groups, every OPASN
@@ -234,25 +244,28 @@ def synthetic_fills(rows: list[dict]) -> list[dict]:
         opt_qty = float(opt.get("qty") or 0)
         if not opt_qty:
             continue
+        # Which side was taken away. Positive qty is a short being closed,
+        # negative a long - and it decides both halves of the pair below.
+        was_short = opt_qty > 0
         out.append({
             "symbol": opt["symbol"],
             "qty": abs(opt_qty),
-            "side": "buy" if opt_qty > 0 else "sell",
+            "side": "buy" if was_short else "sell",
             "price": 0.0,
             "transaction_time": when,
             "seq": 0,
             "multiplier": CONTRACT_MULTIPLIER,
             "synthetic": opt["activity_type"],
-            # Paired: the premium belongs in the share basis, so the option
-            # closes at what it stands at in the books and realizes nothing.
-            "close_at_book": stock is not None,
+            # A short's premium goes into the share basis, so its option
+            # closes at book and realizes nothing. A long's premium was
+            # paid and is realized here, so that one closes at zero.
+            "close_at_book": stock is not None and was_short,
         })
         if stock is None:
             continue
         sh_qty = float(stock.get("qty") or 0)
         direction = 1 if sh_qty > 0 else -1
-        short_sign = 1 if opt_qty > 0 else -1
-        out.append({
+        row = {
             "symbol": stock["symbol"],
             "qty": abs(sh_qty),
             "side": "buy" if sh_qty > 0 else "sell",
@@ -261,9 +274,11 @@ def synthetic_fills(rows: list[dict]) -> list[dict]:
             "seq": 1,
             "multiplier": STOCK_MULTIPLIER,
             "synthetic": stock["activity_type"],
-            "basis_from": opt["symbol"],
-            "basis_sign": -short_sign * direction,
-        })
+        }
+        if was_short:
+            row["basis_from"] = opt["symbol"]
+            row["basis_sign"] = -direction
+        out.append(row)
     return out
 
 
@@ -355,7 +370,8 @@ def realized_by_contract(fills: list[dict]) -> tuple[float, dict[str, float], in
             avg[sym] = 0.0
         book(f, abs(qty))
 
-    return sum(realized.values()), dict(realized), closed_legs, events
+    book = {sym: (qty, avg[sym]) for sym, qty in pos.items() if qty}
+    return sum(realized.values()), dict(realized), closed_legs, events, book
 
 
 def split_activities(rows: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -588,9 +604,31 @@ def group_positions(positions: list[dict]) -> list[dict]:
     The grid's direction is readable from the contract right: this port
     sells put credit spreads on the long side and call credit spreads on
     the short side, so P means long and C means short.
+
+    SHARES get their own rows. They are not part of any spread - they are
+    what an assignment left behind, and the agent flattens them on the next
+    open poll - so counting them as contracts would put half a spread into
+    a grid that does not hold one. They carry `assigned`, and the page can
+    say what they are instead of pretending they are a leg.
     """
     rows: dict[tuple[str, str], dict] = {}
     for p in positions:
+        if OCC.match(p["symbol"]) is None:
+            qty = float(p["qty"])
+            rows[(p["symbol"], "assigned")] = {
+                "underlying": p["symbol"],
+                "direction": "assigned",
+                "assigned": True,
+                "shares": qty,
+                "contracts": 0,
+                "unrealized": float(p["unrealized_pl"]),
+                "market_value": float(p["market_value"]),
+                "cost_basis": float(p["cost_basis"]),
+                "avg_entry": float(p["avg_entry_price"]),
+                "expiries": set(),
+                "strikes": [],
+            }
+            continue
         info = parse_occ(p["symbol"])
         side = "long" if info["right"] == "P" else "short"
         key = (info["underlying"], side)
@@ -618,7 +656,10 @@ def group_positions(positions: list[dict]) -> list[dict]:
         # Two contracts make one spread: a short leg and its wing.
         row["spreads"] = row["contracts"] / 2.0
         # Credit still owed to close, i.e. what the legs are worth now.
-        row["credit_open"] = -row["cost_basis"]
+        # Shares hold no credit - their cost_basis is what was paid for
+        # them, and calling that a credit would add an assignment's whole
+        # notional to the total the page shows as premium collected.
+        row["credit_open"] = 0.0 if row.get("assigned") else -row["cost_basis"]
         out.append(row)
     return sorted(out, key=lambda r: r["unrealized"])
 
@@ -674,8 +715,36 @@ def main() -> int:
 
     cash = float(account["cash"])
     market_value = sum(float(p["market_value"]) for p in positions)
-    unrealized = sum(float(p["unrealized_pl"]) for p in positions)
-    realized, per_contract, closed_legs, events = realized_by_contract(fills)
+    realized, per_contract, closed_legs, events, book = (
+        realized_by_contract(fills))
+    # Unrealized against the basis THIS report rebuilt, not the broker's
+    # unrealized_pl field. The two halves of the identity have to be
+    # measured against the same cost, and on 2026-09-03 the broker's was
+    # not: SLV's avg_entry_price 59.1250 folds 600.00 of premium into 800
+    # shares where the six assignment orders received 597.00 - verified
+    # against the fills AND the orders, 0.71+0.69+0.79+0.84+2x0.84 and
+    # 2x0.63. Ours is the cash that actually moved, so ours is the basis
+    # the identity is measured on, and the difference is REPORTED rather
+    # than absorbed: it had been landing in the provisional fee term,
+    # which is bounded and would have hidden it.
+    unrealized = 0.0
+    basis_drift: list[dict] = []
+    for p in positions:
+        sym = p["symbol"]
+        qty, our_avg = book.get(sym, (0.0, 0.0))
+        mult = STOCK_MULTIPLIER if OCC.match(sym) is None else CONTRACT_MULTIPLIER
+        if abs(qty - float(p["qty"])) > 1e-9:
+            raise AlpacaCliError(
+                f"{sym}: the rebuilt books hold {qty:g} where the account "
+                f"holds {p['qty']} - the reconstruction is missing a "
+                f"transaction, and no number built on it would be honest")
+        unrealized += float(p["market_value"]) - qty * our_avg * mult
+        drift = (our_avg - float(p["avg_entry_price"])) * abs(qty) * mult
+        if abs(drift) >= 0.005:
+            basis_drift.append({
+                "symbol": sym, "ours": round(our_avg, 4),
+                "broker": round(float(p["avg_entry_price"]), 4),
+                "usd": round(drift, 2)})
 
     # Starting capital is what was paid IN, read from the account's own
     # cash bookings - not from the history endpoint's base_value, which was
@@ -847,6 +916,13 @@ def main() -> int:
         "fees_provisional": fees_provisional,
         "fees_provisional_bound": bound,
         "fee_bookings": len(fee_rows),
+        # Where the broker's own avg_entry_price disagrees with the cost
+        # this report rebuilt from the cash that moved. Published rather
+        # than reconciled away: on 2026-09-03 it is SLV, 3.00, because the
+        # broker folded 600.00 of premium into 800 assigned shares where
+        # the six orders that sold those puts received 597.00.
+        "basis_drift": basis_drift,
+        "basis_drift_usd": round(sum(d["usd"] for d in basis_drift), 2),
         "transfers_after_first_fill": late_transfers,
         # What the curve was assembled from, so a reader can see which
         # days were verified and which were refused rather than trusting
@@ -863,7 +939,11 @@ def main() -> int:
         "maintenance_margin": float(account["maintenance_margin"]),
         "open_contracts": len(positions),
         "open_spreads": len(positions) / 2.0,
-        "instruments_open": len(instruments),
+        # GRIDS, not table rows: the assigned-share rows are what an
+        # exercise left behind, not an instrument the agent runs.
+        "instruments_open": sum(1 for r in instruments
+                                if not r.get("assigned")),
+        "assigned_rows": sum(1 for r in instruments if r.get("assigned")),
         "fills": len(fills),
         "closed_legs": closed_legs,
         "curve": curve,
