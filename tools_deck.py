@@ -159,7 +159,42 @@ class Deck:
             self.text(slide, x, Inches(top + 0.28), Inches(width),
                       Inches(0.6), [(value, size, colour, MONO, True)])
 
+    def check_bounds(self) -> None:
+        """Refuse to save a deck with a shape hanging off the slide.
+
+        python-pptx writes XML. It reports no error for a picture placed
+        past the bottom edge, and nothing in the build output says so
+        either - slide 12 shipped with the cover running 0.14" off the
+        bottom and the URL line drawn straight across its own stats strip,
+        two layers of text in the same place, and the only reason it was
+        found is that the slides were exported to PNG and looked at.
+
+        A picture whose height comes from its aspect ratio is exactly the
+        case a human eye is worst at and arithmetic is best at, so the
+        arithmetic runs on every build. Text boxes are exempt: their given
+        height is a starting box that PowerPoint grows or shrinks to the
+        type, so a nominal overhang there means nothing.
+        """
+        bad = []
+        for n, slide in enumerate(self.prs.slides, 1):
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    continue
+                right = shape.left + shape.width
+                bottom = shape.top + shape.height
+                if shape.left < 0 or shape.top < 0 or right > W or bottom > H:
+                    bad.append(
+                        f"slide {n}: {shape.shape_type} at "
+                        f"({shape.left / 914400:.2f}, {shape.top / 914400:.2f}) "
+                        f"size {shape.width / 914400:.2f} x "
+                        f"{shape.height / 914400:.2f} reaches "
+                        f"({right / 914400:.2f}, {bottom / 914400:.2f}) "
+                        f"on a {W / 914400:.2f} x {H / 914400:.2f} slide")
+        if bad:
+            raise SystemExit("shapes outside the slide:\n  " + "\n  ".join(bad))
+
     def save(self, path: str) -> None:
+        self.check_bounds()
         self.prs.save(path)
 
 
@@ -457,17 +492,32 @@ def build(snap: dict, out: str, cover: str | None) -> None:
 
     # 12 -- close ----------------------------------------------------------
     s = d.slide()
+    # The cover is 1200x630, so a full-bleed 11.7" width makes it 6.14"
+    # tall: placed at 1.5" it ended at 7.64" on a 7.5" slide, ran off the
+    # bottom, and the URL line was drawn straight across its own stats
+    # strip - two layers of text in the same place. Rendered and looked at,
+    # which is the only way to see it: python-pptx writes XML and reports
+    # no error for a picture hanging over the edge.
+    #
+    # Sized from the space that is actually free instead: the title ends at
+    # 1.3", the URL line starts at 6.6", so the image gets what is between
+    # and its width follows from the 1200:630 ratio.
+    top, bottom = 1.45, 6.45
+    img_h = bottom - top
+    img_w = img_h * 1200.0 / 630.0
     if cover:
         try:
-            s.shapes.add_picture(cover, Inches(0.8), Inches(1.5),
-                                 width=Inches(11.7))
+            s.shapes.add_picture(cover, Inches((13.333 - img_w) / 2),
+                                 Inches(top), height=Inches(img_h))
         except Exception:                                     # noqa: BLE001
             pass
     d.text(s, Inches(0.8), Inches(0.6), Inches(11.7), Inches(0.7),
            [("Watch it trade", 40, INK, SERIF, True)])
-    d.text(s, Inches(0.8), Inches(6.5), Inches(11.7), Inches(0.6),
+    # 12.0" wide and no "account " label: at 11.7" with it, the id wrapped
+    # onto a second line under the URL.
+    d.text(s, Inches(0.7), Inches(6.6), Inches(12.0), Inches(0.6),
            [("hanky27.github.io/KangarooOptions", 20, ACCENT, MONO, True),
-            (f"   ·   github.com/Hanky27/KangarooOptions   ·   account "
+            (f"   ·   github.com/Hanky27/KangarooOptions   ·   "
              f"{snap['account']}", 14, MUTED, MONO, False)])
 
     d.save(out)
