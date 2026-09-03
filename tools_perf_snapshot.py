@@ -86,6 +86,32 @@ TODAY_BAR_TOLERANCE_PCT = 1.0
 FEE_TYPES = {"FEE"}
 TRANSFER_TYPES = {"JNLC", "JNLS", "CSD", "CSW"}
 
+# What an option's last day looks like in the account, measured over all 32
+# such rows on 2026-09-03:
+#
+#   OPEXP  expired          net_amount 0   qty +1 closing a short, -1 a long
+#   OPASN  assigned         net_amount 0
+#   OPEXC  exercised        net_amount 0
+#   OPTRD  the stock leg    symbol GLD, qty 100, price 405, net -40500
+#
+# The first three move NO cash - they only take the option out of the
+# account - so counting them as a fee or a transfer would be wrong in both
+# directions. The cash is in OPTRD, which is a share trade at the strike.
+#
+# They still have to reach the books, because there is no closing FILL for
+# any of them: an option sold for a credit and then assigned leaves that
+# credit in cash with nothing on the other side of the identity. So each
+# becomes a synthetic close at price 0 - which is exactly what happened, an
+# expiry worth nothing or an intrinsic handed over to the share position -
+# and each OPTRD becomes the share trade that received it, at the strike
+# the broker booked. The stock's own cost basis is then that same strike,
+# which is what its unrealized_pl is measured against.
+OPTION_SETTLEMENT_TYPES = {"OPEXP", "OPASN", "OPEXC"}
+STOCK_TRADE_TYPES = {"OPTRD"}
+
+# Shares are one for one; option contracts are a hundred.
+STOCK_MULTIPLIER = 1
+
 # Every timestamp out of the history endpoint is interpreted in market
 # time, because a trading day is a market-hours window and the queries
 # that fetch one are written in it.
@@ -134,6 +160,113 @@ def fetch_all_fills(cli: AlpacaCli) -> list[dict]:
     return rows
 
 
+def synthetic_fills(rows: list[dict]) -> list[dict]:
+    """The option lifecycle, expressed as the fills the account never got.
+
+    There is no closing FILL when an option expires or is assigned - it
+    simply leaves. Left out, the credit it was sold for sits in cash with
+    nothing on the other side of the identity, and the report cannot close.
+
+    Two shapes come out of here, both in the same dict shape fetch_all_fills
+    returns so they can be merged into one time-ordered list:
+
+    * the option, closed at 0. `qty` in these rows carries the sign of the
+      side being closed - measured over all 21 rows: +1 where a SHORT was
+      taken away (IWM260901C00293000, the short call of the 293/298 spread)
+      and -1 where a LONG was (IWM260901C00298000, its wing). So a positive
+      qty is a buy-to-close and a negative one a sell-to-close.
+    * the shares, at the strike. OPTRD carries the underlying, the share
+      count and the strike it changed hands at - GLD 100 at 405, AMZN -100
+      at 257.5 - and its own sign says which way: shares received are a
+      buy, shares delivered a sell.
+
+    An expiry worth nothing IS a close at zero, and one that stands alone
+    (no OPTRD in its group) is exactly that.
+
+    AN ASSIGNMENT IS NOT. The broker does not realize the premium and then
+    buy the shares at the strike - it FOLDS the premium into the share
+    basis and realizes nothing on the option. Measured 2026-09-03 against
+    avg_entry_price on the three positions still open:
+
+        GLD  strike 405     broker basis 402.330   premium 2.670
+        SLV  strike 59.875  broker basis  59.125   premium 0.750
+        TLT  strike 82.5    broker basis  81.900   premium 0.600
+
+    Closing the option at zero instead put the premium on BOTH sides - our
+    realized and, through avg_entry_price, the broker's unrealized - and
+    the identity came up 927.00 short, to the cent the sum of those three
+    differences. So the option closes at its own book average (realizing
+    nothing) and the shares carry the premium:
+
+        share price = strike + basis_sign * premium
+
+    with basis_sign = -short_sign * direction: short_sign +1 when a SHORT
+    was taken away, -1 for a LONG; direction +1 when shares were received,
+    -1 when delivered. All four combinations are in this account - short
+    put assigned, short call assigned, long call exercised, long put
+    exercised - and the three open ones reproduce the broker's basis.
+
+    The option and its shares are paired by GROUP_ID, which the broker sets
+    on exactly the two rows of one event (measured: 21 groups, every OPASN
+    and OPEXC in a group of two with its OPTRD, every OPEXP alone). They
+    are emitted at one timestamp with the option first, because the share
+    price is read from the option's average and that average is gone once
+    the position closes.
+    """
+    groups: dict[str, list[dict]] = collections.defaultdict(list)
+    for r in rows:
+        kind = r.get("activity_type")
+        if kind in OPTION_SETTLEMENT_TYPES or kind in STOCK_TRADE_TYPES:
+            groups[r.get("group_id") or r["id"]].append(r)
+
+    out: list[dict] = []
+    for gid, rs in groups.items():
+        opt = next((r for r in rs
+                    if r["activity_type"] in OPTION_SETTLEMENT_TYPES), None)
+        stock = next((r for r in rs
+                      if r["activity_type"] in STOCK_TRADE_TYPES), None)
+        if opt is None:
+            raise AlpacaCliError(
+                f"activity group {gid} has shares but no option event: "
+                f"{[r['activity_type'] for r in rs]} - the share basis is "
+                f"read from the option it came from, so this cannot be priced")
+        when = min(r["created_at"] for r in rs)
+        opt_qty = float(opt.get("qty") or 0)
+        if not opt_qty:
+            continue
+        out.append({
+            "symbol": opt["symbol"],
+            "qty": abs(opt_qty),
+            "side": "buy" if opt_qty > 0 else "sell",
+            "price": 0.0,
+            "transaction_time": when,
+            "seq": 0,
+            "multiplier": CONTRACT_MULTIPLIER,
+            "synthetic": opt["activity_type"],
+            # Paired: the premium belongs in the share basis, so the option
+            # closes at what it stands at in the books and realizes nothing.
+            "close_at_book": stock is not None,
+        })
+        if stock is None:
+            continue
+        sh_qty = float(stock.get("qty") or 0)
+        direction = 1 if sh_qty > 0 else -1
+        short_sign = 1 if opt_qty > 0 else -1
+        out.append({
+            "symbol": stock["symbol"],
+            "qty": abs(sh_qty),
+            "side": "buy" if sh_qty > 0 else "sell",
+            "price": float(stock["price"]),
+            "transaction_time": when,
+            "seq": 1,
+            "multiplier": STOCK_MULTIPLIER,
+            "synthetic": stock["activity_type"],
+            "basis_from": opt["symbol"],
+            "basis_sign": -short_sign * direction,
+        })
+    return out
+
+
 def realized_by_contract(fills: list[dict]) -> tuple[float, dict[str, float], int, list[dict]]:
     """Match fills per contract in time order and return realized USD.
 
@@ -169,10 +302,27 @@ def realized_by_contract(fills: list[dict]) -> tuple[float, dict[str, float], in
             "realized": running,
         })
 
+    # An assigned option hands its premium to the shares it became. Both
+    # sides need the SAME number, and it only exists while the option is
+    # still open, so it is read here - one pass, one average, no second
+    # implementation of the rule.
+    premium: dict[str, float] = {}
+
     for f in fills:
         sym = f["symbol"]
         qty = float(f["qty"]) * (1 if f["side"] == "buy" else -1)
         price = float(f["price"])
+        if f.get("close_at_book"):
+            price = avg[sym]
+            premium[sym] = avg[sym]
+        elif f.get("basis_from"):
+            src = f["basis_from"]
+            if src not in premium:
+                raise AlpacaCliError(
+                    f"shares from {src} priced before the option was closed "
+                    f"- the basis would be wrong and the identity would not "
+                    f"close")
+            price = price + f["basis_sign"] * premium[src]
         held = pos[sym]
 
         if held == 0 or (held > 0) == (qty > 0):
@@ -189,7 +339,11 @@ def realized_by_contract(fills: list[dict]) -> tuple[float, dict[str, float], in
         # expression with the sign of the position.
         closing = min(abs(qty), abs(held))
         direction = 1 if held > 0 else -1
-        gain = direction * (price - avg[sym]) * closing * CONTRACT_MULTIPLIER
+        # Per fill, not a constant: the same loop now also matches SHARES,
+        # which are one for one, against option contracts, which are a
+        # hundred. An assignment puts both in the list.
+        gain = (direction * (price - avg[sym]) * closing
+                * float(f.get("multiplier", CONTRACT_MULTIPLIER)))
         realized[sym] += gain
         running += gain
         closed_legs += 1
@@ -215,7 +369,21 @@ def split_activities(rows: list[dict]) -> tuple[list[dict], list[dict]]:
     """
     fees = [r for r in rows if r.get("activity_type") in FEE_TYPES]
     transfers = [r for r in rows if r.get("activity_type") in TRANSFER_TYPES]
-    unknown = {r.get("activity_type") for r in rows} - FEE_TYPES - TRANSFER_TYPES
+    # An option's last day is neither a fee nor a transfer - it reaches the
+    # books as a synthetic fill instead (see synthetic_fills). The claim
+    # that these three move no cash is CHECKED here rather than assumed: it
+    # is the whole reason they may be left out of both buckets.
+    for r in rows:
+        if r.get("activity_type") in OPTION_SETTLEMENT_TYPES:
+            moved = float(r.get("net_amount") or 0)
+            if moved:
+                raise AlpacaCliError(
+                    f"{r['activity_type']} {r.get('symbol')} moved "
+                    f"{moved} USD. These bookings are modelled as cashless "
+                    f"position events, and one that moves cash breaks that "
+                    f"- no number here would be honest until it is remodelled.")
+    unknown = ({r.get("activity_type") for r in rows} - FEE_TYPES
+               - TRANSFER_TYPES - OPTION_SETTLEMENT_TYPES - STOCK_TRADE_TYPES)
     if unknown:
         raise AlpacaCliError(
             f"non-trade booking this report cannot classify: "
@@ -278,8 +446,26 @@ def daily_spine(cli: AlpacaCli, account: dict) -> list[tuple[int, float]]:
     return spine
 
 
-def intraday(cli: AlpacaCli, day: str) -> list[tuple[int, float]]:
-    """One trading day at 5-minute resolution, or nothing."""
+def intraday(cli: AlpacaCli, day: str,
+             clock: dict | None = None) -> list[tuple[int, float]]:
+    """One trading day at 5-minute resolution, or nothing.
+
+    A session that has not started yet has no bars, and asking for one is
+    an ERROR rather than an empty answer: the endpoint clamps `end` to the
+    last session it has and then rejects its own window - measured
+    2026-09-03 at 05:53 ET,
+
+      "start cannot be after end. start: 2026-09-03T09:30:00-04:00,
+       end: 2026-09-02T09:30:00-04:00: bad request"
+
+    which took the whole publish down every five minutes between midnight
+    and the opening bell. The clock says whether the day has begun: while
+    the market is closed and the next open is still today, it has not.
+    """
+    if clock and not clock.get("is_open"):
+        nxt = str(clock.get("next_open") or "")
+        if nxt[:10] == day and clock["timestamp"] < nxt:
+            return []
     h = cli._run(["account", "portfolio",
                   "--start", f"{day}T09:30:00-04:00",
                   "--end", f"{day}T16:00:00-04:00",
@@ -304,7 +490,7 @@ def fetch_curve(cli: AlpacaCli, account: dict,
     points: list[tuple[int, float]] = []
     for ts, close in spine:
         day = dt.datetime.fromtimestamp(ts, ET).strftime("%Y-%m-%d")
-        bars = intraday(cli, day)
+        bars = intraday(cli, day, clock)
         # The day's own bars are kept only if they end where the spine
         # says that day ended. Monday - the funding day - does not, and
         # contributes its single close instead of a line 100,000 too high.
@@ -324,7 +510,7 @@ def fetch_curve(cli: AlpacaCli, account: dict,
     # as it stands right now.
     if not any(dt.datetime.fromtimestamp(t, ET).strftime("%Y-%m-%d") == today
                for t, _e in points):
-        bars = intraday(cli, today)
+        bars = intraday(cli, today, clock)
         h = cli._run(["account", "portfolio", "--period", "1D",
                       "--timeframe", "5Min"])
         equity_now = float(account["equity"])
@@ -478,6 +664,13 @@ def main() -> int:
     # the account existed, so nothing can fall outside it.
     bookings = cli.activities(after=account["created_at"][:10])
     fee_rows, transfer_rows = split_activities(bookings)
+
+    # An option that expired or was assigned never produced a closing FILL,
+    # and the shares it turned into never produced an opening one. Both are
+    # merged into the fill list, in time order, so ONE average-cost pass
+    # sees the whole life of every position.
+    fills = sorted(fills + synthetic_fills(bookings),
+                   key=lambda f: (f["transaction_time"], f.get("seq", 0)))
 
     cash = float(account["cash"])
     market_value = sum(float(p["market_value"]) for p in positions)

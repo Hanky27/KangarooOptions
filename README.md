@@ -119,9 +119,15 @@ disclosed. What predates the hackathon:
   part of this submission, and nothing in this repository requires them -
   `tools_week.py`, `tools_portfolio.py` and `backtest_options.py` run
   standalone.
-- **No LLM is in the trading loop.** The agent is deterministic. This is
-  stated plainly rather than dressed up: what is autonomous here is the
-  full decision-and-execution cycle, not a language model.
+- **The LLM came later, and it can only subtract.** This line used to read
+  "no LLM is in the trading loop"; that was true until `8d139b6`, when the
+  risk gate went live. What is in the loop is narrow and clamped in code:
+  on a rebuy that matters, `claude-sonnet-5` sees the whole account and
+  answers how much of the requested size survives, between zero and what
+  was asked. It never opens a position, enlarges one, picks a strike or
+  moves a stop, and it fails open. Everything else about the agent is
+  deterministic - the grid needs no opinion about direction, and giving a
+  model one would have been theatre.
 
 ## Strategy
 
