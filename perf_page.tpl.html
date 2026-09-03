@@ -1,5 +1,28 @@
 <title>Kangaroo Grid Live Sheet</title>
 
+<!-- This page had NO meta tags at all - no charset, no viewport, no share
+     card. Measured 2026-09-03 with a 375 px mobile viewport emulated: the
+     page reported innerWidth 981, because a phone without a viewport
+     declaration lays out at the ~980 px default and then scales the whole
+     thing down. Everything on it was unreadable on a phone, and this URL
+     is the submission's Application URL.
+
+     The charset is served correctly by GitHub Pages (Content-Type:
+     text/html; charset=utf-8, measured), but the file also gets opened
+     from disk, where no header exists and the page's em dashes and middots
+     would be guessed at.
+
+     og:image points at cover.png next to this file - HTTP 200,
+     image/png, 50,532 bytes, measured on the live URL. -->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="An options credit-spread grid on 25 instruments, and a model that may only take risk away. Every figure is read back through the Alpaca CLI and must reconcile to the cent.">
+<meta property="og:type" content="website">
+<meta property="og:title" content="Kangaroo Options — live on the wire">
+<meta property="og:description" content="An autonomous options grid reporting on itself. Every figure read back from the broker; the page refuses to publish if the books do not reconcile to the cent.">
+<meta property="og:image" content="https://hanky27.github.io/KangarooOptions/cover.png">
+<meta name="twitter:card" content="summary_large_image">
+
 <!--
 MIT License
 Copyright (c) 2026 Heinrich Munz
