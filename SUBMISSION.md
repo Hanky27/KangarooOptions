@@ -154,6 +154,27 @@ An empty answer and a timeout. Neither changed a position, neither
 stopped the agent, and both are distinguishable from *"the gate agreed"*
 after the fact — which is the entire reason the counters exist.
 
+None of the figures above were typed by hand. They come out of the logs,
+and so can anyone else's:
+
+```
+python tools_gate_report.py --logs logs
+
+  decisions by the model     49
+    left unchanged            5
+    reduced                  31
+    refused outright         13
+  contracts asked for       108
+  contracts allowed          38
+  size removed              65 %
+  latency ms              min 1630  max 11458  mean 6172
+  answers above the request   0   (the clamp holds)
+```
+
+The last line is the safety property checked against the RECORD rather
+than against the code that implements it: over 49 decisions the model
+never once got back more than the grid had already asked for.
+
 ## The Alpaca implementation
 
 **The CLI is the only broker interface** — `alpaca`, pinned to v0.0.13.
