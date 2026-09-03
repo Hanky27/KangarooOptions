@@ -53,6 +53,8 @@ import yaml
 
 from alpaca_cli import AlpacaCli, AlpacaCliError
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+
 # OCC option symbol: root, YYMMDD, C/P, strike * 1000, zero padded to 8.
 OCC = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d{8})$")
 
@@ -670,11 +672,25 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--equity-log", default="state/equity_log.jsonl",
                     help="append-only record of every equity this report "
-                         "has measured; the curve is drawn from it")
+                         "has measured; the curve is drawn from it. A "
+                         "relative path is resolved against this file's "
+                         "directory, never the working directory")
     ap.add_argument("--max-attempts", type=int, default=10,
                     help="how many times to re-sample when a fill lands "
                          "inside the reading window")
     args = ap.parse_args()
+
+    # ABSOLUTE, against this file's directory - never the working
+    # directory. The publish job is a scheduled task with an EMPTY
+    # WorkingDirectory, so Windows starts it in C:\Windows\System32, where
+    # the default "state/equity_log.jsonl" became a request to create a
+    # `state` folder inside System32. Measured 2026-09-03: every scheduled
+    # run died with "PermissionError: [WinError 5] Zugriff verweigert:
+    # 'state'" while the same command run by hand in the repo worked, which
+    # is the worst shape a bug can have. Same rule the agent already
+    # applies to its per-instrument state files.
+    if not os.path.isabs(args.equity_log):
+        args.equity_log = os.path.join(HERE, args.equity_log)
 
     with open(args.config, "r", encoding="utf-8") as fh:
         cfg = yaml.safe_load(fh)
