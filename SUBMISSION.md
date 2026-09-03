@@ -197,12 +197,33 @@ peaks in the middle, QQQ is flat to worse, on 3–16 clusters each. It is in
 the log as a non-finding, because the SPY column alone would have made a
 good slide.
 
-Seven defects were found and fixed while it traded live; each is in
-[DEVLOG.md](DEVLOG.md) with the measurement that found it and the
-regression test that covers it. Three of them were not in the agent — they
-were in what the project *said* about itself, and one put a maximum
-drawdown of −102,137.75 on the public page that had never happened.
+**Fifteen defects were found and fixed while it traded live**, eight of
+them on the final Thursday alone, when the account's first assignments
+arrived. Each is in [DEVLOG.md](DEVLOG.md) with the measurement that found
+it and the regression test that covers it. Six were not in the agent at
+all — they were in what the project *said* about itself. One put a maximum
+drawdown of −102,137.75 on the public page that had never happened; one
+was a fix of mine that silently deleted the method the whole report ran
+on, visible in its own diff as 39 insertions against 54 deletions.
 
-The strategy still does what it was built to do: **59 clusters closed**
-for **+2,168 realized**, books reconciling to the cent, no halts. What was
-wrong was the expectation.
+The Thursday eight share a shape worth naming, because it is the actual
+lesson of this project: **each was invisible in exactly the place someone
+would have looked.** A deleted method that only shows up as a line count.
+A hardcoded workstation path inside the module every test replaced. A
+deadlock that needed two individually correct behaviours to meet. A
+double-flatten that needed an assignment and an open market on the same
+day — which had never happened until it did. Orders the *broker* placed on
+this account, indistinguishable from ours until you read the id. A premium
+counted on both sides of an identity that still balanced, because a
+bounded tolerance was absorbing it. And a failure that existed only when
+the scheduled task ran, never when the same command was typed by hand.
+
+None was found by reading code harder. Each was found by asking the
+account a question and comparing the answer to what the code assumed —
+and in the one case where I reasoned instead of measured, by an experiment
+that told me my explanation was wrong.
+
+Measured now, through the same CLI: **648 fills, 2,414 contracts, 224 legs
+closed, residual 0.0000**, and every one of 99 open positions rebuilt from
+the cash that moved. The account is down 12.3 %. Both facts are on the
+page, and the page refuses to publish either unless they add up.

@@ -717,3 +717,209 @@ half-dollar grid, the GOOGL leg-on-its-own-wing collision, a filled close
 with no remaining position, the six fee bookings at six different amounts,
 and the inflated 1D series set against the honest one. The suite could
 not have found them first; it can keep them from coming back.
+
+---
+
+## Thursday: eight defects, and how each one was hidden
+
+The account's first assignment weekend arrived on Wednesday night, and by
+Thursday morning nothing about the system was quite what it claimed. Five
+defects in the agent, three in the reporting, and every single one had a
+reason it had stayed invisible.
+
+### 1. The fix for the last defect deleted a method
+
+`32977da` — the pagination fix, and a good one — replaced the source slice
+from `def orders_since(` to `def order_get(`. `activities()` lived between
+them. The commit reads **39 insertions, 54 deletions** for a new function
+of 37 lines. The balance was in the diff and nobody looked at it.
+
+`tools_perf_snapshot.py:479` calls `cli.activities()`, so the publisher
+raised `AttributeError` every five minutes for 36 hours, 498 runs, and the
+public page froze at `2026-09-01T14:09:55-04:00` while the write-up
+claimed it republished every five.
+
+### 2. A live code path read a file that exists on one machine
+
+`fetch_alpaca_bars.py` hardcodes
+
+    ENV_FILE = "C:/Users/HMz/Documents/Source/McpServer/.../env.txt"
+
+and `agent.settlement_close` called into it. On the trading host neither
+that path nor the CLI beside it exists, so every settlement of an expired
+leg raised `FileNotFoundError`. IWM_short halted at startup; AAPL_short
+after 20 consecutive failed polls.
+
+The agent's own broker handle takes both paths from `config.yaml`, which
+is why the same code runs on a workstation and on a VPS. Settlement now
+goes through it.
+
+### 3. An assignment could deadlock an instrument forever
+
+`handle_expiries` defers settling an expired leg while the account still
+holds the assigned stock — booking an intrinsic settlement beside the
+shares would count the same money twice. `reconcile`, next in line, then
+found the leg missing and halted the instrument. **And a halted instrument
+never reaches `step()`, which is the only place `assignment_gate` flattens
+the stock that caused the deferral.** GLD_long sat in that loop with 100
+GLD in the account. No restart could ever have cleared it.
+
+### 4. And it would have flattened the same stock twice, that afternoon
+
+`assignment_gate` reads the position snapshot the loader takes **once per
+poll** and shares with all 25 instruments. AMZN_long and AMZN_short both
+see the same `-100 AMZN` row. Both buy 100. The account ends up +100 long
+a stock nobody chose.
+
+It had never fired — zero `assign_flat` orders in the account's entire
+history, because no assignment had yet met an open market. Four
+underlyings held assigned stock and the bell was four hours away.
+
+### 5. The broker trades this account too, and it does not use our order ids
+
+GLD_long was still halted after (3) was fixed, and the reason was not an
+assignment. On 2026-09-02 at 19:45:07Z, fifteen minutes before the close,
+three filled orders appeared that this agent never submitted:
+
+    GLD260902P00401000  buy 1 @ 0.02   coid 6e8b6bab-7b07-...
+    GLD260902P00405000  buy 1 @ 2.92   coid a8349f27-aa0c-...
+    (mleg, symbol null)      @ 4.13    coid f4d852c1-c265-...
+
+Broker UUIDs, not the `kang_<instrument>_c<cluster>_l<leg>_<kind>` scheme
+every order of ours carries. Alpaca's paper engine closes short options by
+itself near expiry. `recover_unbooked_close` could not see them twice
+over: it matches on our prefix, and it only ends a cluster when *every*
+leg is gone — this was three of four.
+
+`book_broker_closes` books such a leg and books nothing it cannot
+evidence: the short exit must be a filled buy at a price the broker
+reports, the wing either a filled sell or an `OPEXP` row. A wing still
+held raises rather than valuing half a spread.
+
+The third of those three fills is the reason this was **dry-run against
+the live state files before it was deployed**: the dry run printed three
+broker fills where the code could see two. The mleg shape carries
+`symbol: null` at the top level and the real symbols inside `legs`, so
+reading only the top level would have missed a whole spread. The same dry
+run confirmed what the fix was worth — **+49.00 on GLD_long, and nothing
+else** — which is exactly what the deployed run then booked.
+
+### Why 93 passing tests saw none of it
+
+Every one of them replaced the boundary that was broken. The settlement
+tests monkeypatched `agent.fetch_bars` itself; the reporting tests hand
+the code a fake CLI, and a fake CLI grows whatever method it is asked for.
+
+So `test_cli_contract.py` reads the **source** instead of calling it:
+every `cli.<name>(` in the repo must exist on `AlpacaCli`, and nothing
+reachable from `agent.py` may hardcode an absolute path. Both were
+verified by putting each defect back and watching the new test fail.
+
+## The reporting, and a premium counted twice
+
+With `activities()` restored, the report immediately refused four booking
+types it had never seen: `OPEXP`, `OPASN`, `OPEXC`, `OPTRD`. Measured over
+all 32 rows: the first three move **exactly 0 USD** — they only take the
+option out of the account — and `group_id` pairs each one with its share
+trade (21 groups, every `OPASN`/`OPEXC` with an `OPTRD`, every `OPEXP`
+alone).
+
+They still have to reach the books, because there is no closing fill for
+any of them. An option sold for a credit and then assigned leaves that
+credit in cash with nothing on the other side of the identity.
+
+**The first model was wrong, and the correction took two attempts.**
+Closing the option at zero and buying the shares at the strike counts the
+premium twice: the broker folds it into the share basis instead. Its own
+`avg_entry_price` says so —
+
+| | strike | broker basis | what happened |
+|---|---|---|---|
+| GLD | 405 | 402.330 | assigned |
+| SLV | 59.875 | 59.125 | assigned |
+| TLT | 82.5 | 81.900 | assigned |
+| AMZN | 265 | **265.000** | exercised |
+
+The identity came up **927.00** short, to the cent the sum of the three
+assigned differences. Then I tried leaving the basis at the strike for
+`OPEXC` and reported that it made things *worse* — 373 to 567 — and
+therefore that the idea was wrong.
+
+It was wrong because I had changed one of two coupled things. The premium
+has to be somewhere, and there are exactly two places:
+
+    short taken away (OPASN)   option closes at BOOK, realizing nothing
+                               shares at strike ± premium
+    long exercised   (OPEXC)   option closes at ZERO, realizing −premium
+                               shares at the strike
+
+Both halves move together or neither does. Checked the other way too: a
+312.5/317.5 call spread that finished fully in the money realizes
+`(credit − 5) × 100` under this rule, which is what a five-wide spread
+losing every dollar of its width is worth.
+
+### A bounded term was swallowing the rest
+
+With the pairing fixed the identity closed — and **3.00 was sitting in the
+provisional fee term**, which is bounded at 43.30 and would have hidden
+anything under it. It was not a fee. It was SLV: the broker's basis folds
+600.00 of premium into 800 assigned shares where the six orders that sold
+those puts received **597.00**, verified against the fill activities and
+the orders separately.
+
+Two costs for one position is the disease. Unrealized is now measured
+against the basis this report rebuilt from the cash that moved, not the
+broker's `unrealized_pl` field, so both halves of the identity speak the
+same language — and where the two views differ it is **published, per
+symbol, on the page**. Residual 0.0000, provisional fees 0.00, 99 of 99
+positions rebuilt.
+
+### Two more reasons the page was down
+
+**The history endpoint errors before the opening bell.** Asking for
+today's 09:30–16:00 window when the session has not started is not an
+empty answer: it clamps `end` to the last session it has and then rejects
+its own window. Every publish between midnight and the open died on it.
+
+**The live fetch had been reading a two-day-old snapshot.**
+`cache: "no-store"` only bypasses the *browser's* cache.
+`raw.githubusercontent.com` sits behind a CDN, and a CORS request gets a
+different cached variant than a plain one — measured seconds apart, `curl`
+received the snapshot stamped 07:09:51 ET while the page's own fetch
+received one from 2026-09-01. The freshness check refused to go backwards
+and kept the built-in copy, so nothing wrong was ever shown; the fetch had
+simply stopped being live. A unique query string is a different cache key.
+
+**And the one that could not be found by running the command.** The
+scheduled task has an empty `WorkingDirectory`, so Windows starts it in
+`C:\Windows\System32`. The default `--equity-log` is the relative
+`state/equity_log.jsonl`, which there means creating a `state` folder
+inside System32:
+
+    PermissionError: [WinError 5] Zugriff verweigert: 'state'
+
+every five minutes, while the identical command typed in the repo worked
+every time. Verified the way the task does it, not the way I do it: run
+from `C:\Windows\System32` it now completes with residual 0.0000, and the
+task reports `rc=0` where it had reported `rc=1` for 36 hours.
+
+## What Thursday has in common with Monday
+
+Monday's lesson was that a number nobody checks is a number nobody can
+trust. Thursday's is narrower and worse: **every one of these eight was
+invisible in exactly the place someone would have looked.**
+
+The deleted method was in the diff, as a line count. The workstation path
+was in a module the tests replaced. The deadlock needed two correct
+behaviours to meet. The double-flatten needed an assignment and an open
+market on the same day, which had never happened. The broker's own orders
+look like ours until you read the id. The premium was on both sides of an
+identity that still balanced to within a bounded tolerance. And the
+`System32` failure existed only in a context that is never typed by hand.
+
+Nothing was found by reading code harder. Each one was found by asking the
+account a question and comparing the answer to what the code assumed —
+and, in the one case where I reasoned instead of measured, by an
+experiment that told me my explanation was wrong.
+
+107 tests. The page is live again.
