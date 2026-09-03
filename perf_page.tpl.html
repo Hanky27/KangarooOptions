@@ -1239,7 +1239,18 @@ Do not edit docs/index.html - it is the output, this file is the source.
 
     if (!BOOT.live_url) { return; }
 
-    fetch(BOOT.live_url, { cache: "no-store" })
+    // `cache: "no-store"` only bypasses the BROWSER's cache. raw.github
+    // usercontent.com sits behind a CDN that serves a cached copy for
+    // minutes, and a CORS request gets a different cached variant than a
+    // plain one: measured 2026-09-03 11:14 UTC, curl received the snapshot
+    // stamped 07:09:51 ET while this page's own fetch, seconds later,
+    // received one from 2026-09-01. The page correctly refused to go
+    // backwards and kept its built-in copy - but it also never saw a fresh
+    // number. A unique query string is a different cache key.
+    var liveUrl = BOOT.live_url +
+      (BOOT.live_url.indexOf("?") === -1 ? "?" : "&") + "t=" + Date.now();
+
+    fetch(liveUrl, { cache: "no-store" })
       .then(function (r) {
         if (!r.ok) { throw new Error("HTTP " + r.status); }
         return r.json();
