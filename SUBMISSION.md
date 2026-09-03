@@ -126,6 +126,34 @@ assumes the model misbehaves.
 > it is a dated decision rather than a default, and the startup banner
 > says which of the two a given run was.
 
+**What it has actually done**, counted out of the agent logs rather than
+described — 49 decisions:
+
+| | |
+|---|---|
+| left the request unchanged | 5 |
+| reduced it | 31 |
+| **refused it outright** (→ 0) | **13** |
+| contracts asked for | 108 |
+| contracts allowed | 38 |
+| latency | 1.6 – 11.5 s, mean 6.2 s |
+
+So the model took away **65 % of the size the grid asked for**, and a
+third of the time it allowed nothing at all — while never once being able
+to add anything, because the clamp does not permit it.
+
+And the fail-open property is not a claim either. It has fired twice, both
+logged, both passing the grid's own request through untouched:
+
+```
+META_short: RISK GATE [error] 3 -> 3 (12858 ms): no JSON object in answer: ''
+MSFT_long:  RISK GATE [error] 1 -> 1 (15036 ms): TimeoutError: The read operation timed out
+```
+
+An empty answer and a timeout. Neither changed a position, neither
+stopped the agent, and both are distinguishable from *"the gate agreed"*
+after the fact — which is the entire reason the counters exist.
+
 ## The Alpaca implementation
 
 **The CLI is the only broker interface** — `alpaca`, pinned to v0.0.13.

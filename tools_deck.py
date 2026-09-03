@@ -274,17 +274,30 @@ def build(snap: dict, out: str, cover: str | None) -> None:
         "Multiple clusters (AMZN, TSLA, GLD, SLV) already breached",
         "5% adverse simultaneously; reduce to conserve shared margin.",
     ], size=17, colour=INK)
-    d.bullets(s, 4.25, [
+    d.bullets(s, 4.15, [
         ("It halved the size.", "And justified it by naming four OTHER "
-                                "instruments."),
-        ("That is the whole argument.", "No single cluster's state machine "
-                                        "can see AMZN, TSLA, GLD and SLV "
-                                        "at once. A threshold cannot "
-                                        "either."),
-        ("10.1 seconds.", "Measured 4.03 s before it went live; the real "
-                          "view carries all 25 clusters. Hence: at most "
-                          "three consults per poll."),
+                                "instruments. No single cluster's state "
+                                "machine can see AMZN, TSLA, GLD and SLV "
+                                "at once. A threshold cannot either."),
     ], size=16, gap=0.66)
+    d.text(s, Inches(0.8), Inches(5.05), Inches(11.7), Inches(0.4),
+           [("49 DECISIONS SINCE, ALL FROM THE AGENT LOG", 13, MUTED,
+             MONO, True)])
+    d.stats(s, 5.45, [
+        ("unchanged", "5", MUTED),
+        ("reduced", "31", INK),
+        ("refused to 0", "13", ACCENT),
+        ("contracts asked", "108", MUTED),
+        ("allowed", "38", ACCENT),
+    ], size=26)
+    d.text(s, Inches(0.8), Inches(6.45), Inches(11.7), Inches(0.5),
+           [("Twice it failed and passed the request through untouched, "
+             "loudly: ", 15, MUTED, SERIF, False),
+            ("3 -> 3, no JSON object in answer", 15, INK, MONO, False),
+            ("  and  ", 15, MUTED, SERIF, False),
+            ("1 -> 1, read timed out", 15, INK, MONO, False),
+            (". Failing closed would make an outage a silent strategy "
+             "change.", 15, MUTED, SERIF, False)])
 
     # 6 -- Alpaca ----------------------------------------------------------
     s = d.slide()
