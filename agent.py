@@ -100,9 +100,8 @@ from datetime import date, timedelta
 
 import yaml
 
-from alpaca_cli import AlpacaCli, AlpacaCliError
+from alpaca_cli import AlpacaCli, AlpacaCliError, OPTION_SETTLEMENT_TYPES
 from risk_gate import RiskGate
-from fetch_alpaca_bars import fetch as fetch_bars
 from kangaroo_core import KangarooCore, settlement_pnl
 
 TERMINAL_BAD = {"canceled", "expired", "rejected", "done_for_day",
@@ -407,14 +406,35 @@ class Instrument:
             f"{self.core.cluster_id}.")
         return True
 
-    def reconcile(self, positions: dict) -> None:
+    def reconcile(self, positions: dict, settled: set[str] | None = None) -> None:
         """Every spread leg in the state must exist in the account: the
         short put as a short position, the wing as a long position, each
         with at least the leg's quantity. Any mismatch aborts. `positions`
         is the account-wide snapshot the loader read once for all
-        instruments."""
+        instruments.
+
+        `settled` is the set of option symbols the BROKER has booked as
+        expired, assigned or exercised (OPEXP / OPASN / OPEXC). Such a leg
+        is legitimately absent from the account, and while the resulting
+        stock is still held handle_expiries deliberately defers booking it
+        - so calling it a mismatch deadlocks the instrument: reconcile
+        halts it at startup, and a halted instrument never reaches step(),
+        where assignment_gate would have flattened the stock that made the
+        deferral necessary. Measured on 2026-09-03: GLD_long sat halted
+        with GLD 100 shares in the account from an assigned 405 put, and
+        no restart could ever have cleared it.
+
+        The exemption is deliberately narrow: it needs the broker's own
+        record AND the stock position that proves the deferral is live.
+        A leg that is merely missing still aborts.
+        """
         if not self.core.legs:
             return
+        settled = settled or set()
+        held_stock = positions.get(self.underlying)
+
+        def deferred(occ: str) -> bool:
+            return bool(held_stock) and occ in settled
 
         def held(occ: str, want_short: bool, qty: int) -> bool:
             p = positions.get(occ)
@@ -426,12 +446,14 @@ class Instrument:
 
         for leg in self.core.legs:
             extra = self.leg_extras[leg.option_symbol]
-            if not held(leg.option_symbol, True, leg.qty):
+            if not held(leg.option_symbol, True, leg.qty) \
+                    and not deferred(leg.option_symbol):
                 raise AlpacaCliError(
                     f"{self.underlying}: state/positions mismatch: short leg "
                     f"{leg.option_symbol} x{leg.qty} not present as short - "
                     f"refusing to trade")
-            if not held(extra["wing_occ"], False, leg.qty):
+            if not held(extra["wing_occ"], False, leg.qty) \
+                    and not deferred(extra["wing_occ"]):
                 raise AlpacaCliError(
                     f"{self.underlying}: state/positions mismatch: wing "
                     f"{extra['wing_occ']} x{leg.qty} not present as long - "
@@ -713,8 +735,12 @@ class Instrument:
         """Underlying close of the expiry day - the price the expiring legs
         settle against, exactly as the simulator does it. Fails loud when
         the bar is missing: guessing a settlement price would silently move
-        the cluster's whole pot."""
-        bars = fetch_bars(self.underlying, "1Day", expiry, expiry)
+        the cluster's whole pot.
+
+        Through self.cli, not fetch_alpaca_bars: that module hardcodes the
+        author's workstation paths and raised FileNotFoundError for every
+        settlement on the trading host (see AlpacaCli.daily_bars)."""
+        bars = self.cli.daily_bars(self.underlying, expiry, expiry)
         if not bars:
             raise AlpacaCliError(
                 f"no {self.underlying} daily bar for expiry {expiry} - "
@@ -772,7 +798,17 @@ class Instrument:
 
     def assignment_gate(self, positions: dict) -> None:
         """An assigned stock position is flattened immediately (user rule
-        from the reference options bot: no wheel, close assignments)."""
+        from the reference options bot: no wheel, close assignments).
+
+        `positions` is the snapshot the loader reads ONCE per poll and
+        shares with all 25 instruments, so this removes the symbol from it
+        after flattening. Without that, both directions of one underlying
+        act on the same stale row: AMZN_long and AMZN_short each see the
+        -100 AMZN left by an assignment, each buy 100, and the account ends
+        up +100 long a stock nobody chose. It had never fired before
+        2026-09-03 - no assignment had yet met an open market - so the
+        collision was still unmeasured when the assignments arrived.
+        """
         p = positions.get(self.underlying)
         if p is None:
             return
@@ -788,6 +824,10 @@ class Instrument:
         while True:                 # market order: await the fill
             o = self.cli.order_get(order["id"])
             if o["status"] == "filled":
+                # The shared snapshot must stop showing what is no longer
+                # held, or the other direction of this underlying flattens
+                # it a second time and opens the opposite position.
+                positions.pop(self.underlying, None)
                 self.say(f"assignment flattened: {o.get('filled_avg_price')}")
                 return
             if o["status"] in TERMINAL_BAD:
@@ -958,14 +998,50 @@ class KangarooAgent:
         recent_orders = self.cli.orders_since(clock["timestamp"][:10])
         log(f"broker reports {len(recent_orders)} order(s) since "
             f"{clock['timestamp'][:10]}")
+        # Read every state file BEFORE anything is decided about it: the
+        # settlement window below is derived from the expiries they carry,
+        # and a load failure must halt its own instrument, not the pass.
+        for inst in self.instruments:
+            try:
+                inst.load_state()
+            except Exception:                                # noqa: BLE001
+                inst.halted = True
+                inst.say(f"HALTED AT STARTUP - state file unreadable; it "
+                         f"is untouched and needs a human:\n"
+                         f"{traceback.format_exc()}")
+        # What the broker settled by itself. A leg it booked as expired,
+        # assigned or exercised is legitimately gone from the account, and
+        # reconcile must not call that a mismatch - see Instrument.reconcile
+        # for the deadlock it caused. The window starts at the oldest expiry
+        # still carried in any state file, because an assignment sits
+        # unsettled for as long as the stock is held.
+        oldest = min((x["expiry"] for i in self.instruments
+                      if not i.halted for x in i.leg_extras.values()),
+                     default=None)
+        settled: set[str] = set()
+        if oldest:
+            rows = self.cli.activities(after=oldest)
+            settled = {r["symbol"] for r in rows
+                       if r.get("activity_type") in OPTION_SETTLEMENT_TYPES
+                       and r.get("symbol")}
+            log(f"broker settled {len(settled)} option symbol(s) since "
+                f"{oldest} (expiry, assignment or exercise)")
         for inst in self.instruments:
             # Startup is where a RESTART fails: a state file that no longer
             # matches the account stops the instrument it belongs to, not
             # the other 24 - those may hold open positions that need
             # managing right now. Same rule as the poll loop: the
             # instrument stops, loudly, and is named in the summary.
+            if inst.halted:
+                continue
             try:
-                inst.load_state()
+                # An assignment left stock in the account. Flatten it here
+                # too, not only in step(): handle_expiries defers settlement
+                # while the stock is held, and an instrument halted at
+                # startup never reaches step() - so without this a restart
+                # after an assignment can never clear itself.
+                if clock["is_open"]:
+                    inst.assignment_gate(positions)
                 # Settle first, THEN reconcile: an expired leg is gone from
                 # the account, so reconcile would reject the state file it
                 # just read and the agent could never restart after a
@@ -975,7 +1051,7 @@ class KangarooAgent:
                 # a close it filled while this agent was being stopped is
                 # not a mismatch, it is a cluster that ended.
                 inst.recover_unbooked_close(positions, recent_orders)
-                inst.reconcile(positions)
+                inst.reconcile(positions, settled)
             except Exception:                                # noqa: BLE001
                 inst.halted = True
                 inst.say(f"HALTED AT STARTUP - it will not trade in this "

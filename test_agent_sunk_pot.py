@@ -73,6 +73,19 @@ class StubCli:
         return {"account_number": "STUB", "options_approved_level": 3,
                 "options_trading_level": 3, "equity": 100000}
 
+    def daily_bars(self, symbol, start, end):
+        """The settlement bar, stubbed at the SAME boundary the agent uses.
+
+        It used to be stubbed one level lower, on the module function
+        `agent.fetch_bars`. That hid a defect completely: fetch_alpaca_bars
+        reads its keys from a hardcoded path on the author's workstation,
+        which does not exist on the trading host, so every settlement there
+        raised FileNotFoundError while all four of these tests passed. A
+        stub that replaces the broken thing cannot see that it is broken.
+        """
+        self.calls.append("daily_bars")
+        return list(_SETTLEMENT_BARS)
+
 
 def make_agent(cli, *, legs, sunk_pot=0.0):
     """An agent with a hand-built cluster and no I/O beyond the stub."""
@@ -97,10 +110,13 @@ def make_agent(cli, *, legs, sunk_pot=0.0):
     return a
 
 
+_SETTLEMENT_BARS: list[dict] = []
+
+
 def patch_settlement(monkey_close=SETTLE_CLOSE):
-    """Replace the network fetch with a fixed bar."""
-    agent_mod.fetch_bars = lambda sym, tf, start, end: (
-        [{"c": monkey_close, "t": start}] if monkey_close else [])
+    """Fix the settlement bar StubCli.daily_bars will hand back."""
+    _SETTLEMENT_BARS[:] = ([{"c": monkey_close, "t": "2026-09-04"}]
+                           if monkey_close else [])
 
 
 class _Core:
@@ -116,6 +132,14 @@ class StubInstrument:
         self.halted, self.failures, self.steps = False, 0, 0
         self._fail_step, self._fail_start = fail_step, fail_start
         self.said = []
+        # The loader reads this after load_state to find the oldest expiry
+        # still carried, which bounds the settlement window it asks the
+        # broker for. Empty here: these tests are about the halt bookkeeping.
+        self.leg_extras: dict = {}
+        self.flattened = 0
+
+    def assignment_gate(self, positions):
+        self.flattened += 1
 
     def say(self, msg, ts=None):
         self.said.append(msg)
@@ -130,7 +154,7 @@ class StubInstrument:
     def recover_unbooked_close(self, positions, orders):
         return False
 
-    def reconcile(self, positions):
+    def reconcile(self, positions, settled=None):
         pass
 
     def leg_symbols(self):

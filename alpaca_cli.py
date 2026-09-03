@@ -49,6 +49,16 @@ class AlpacaCliError(RuntimeError):
 # endpoint answers `{"error": "symbol limit is 100", "status": 400}` and
 # returns NOTHING when the list is longer, which is how the agent died on
 # 2026-09-01 with 102 open legs.
+# The broker's option lifecycle bookings: the option leaves the account and
+# stock takes its place. Measured 2026-09-03 over all 21 such rows on the
+# competition account: net_amount is exactly "0" on every one of them. The
+# CASH of an assignment moves in a separate OPTRD row - a stock trade at the
+# strike, e.g. {"symbol": "GLD", "qty": "100", "price": "405",
+# "net_amount": "-40500"} - which is why these three may never be counted as
+# a fee or a transfer, and why the OPTRD rows must be.
+OPTION_SETTLEMENT_TYPES = frozenset({"OPEXP", "OPASN", "OPEXC"})
+OPTION_STOCK_TRADE_TYPE = "OPTRD"
+
 QUOTE_SYMBOL_LIMIT = 100
 
 # The most orders one `order list` response can carry. Not a choice: the
@@ -178,6 +188,38 @@ class AlpacaCli:
                 "option contracts listing is paginated - result would be incomplete")
         return body["option_contracts"]
 
+    def daily_bars(self, symbol: str, start: str, end: str) -> list[dict]:
+        """Split-adjusted daily bars of one stock/ETF, inclusive both ends.
+
+        The agent settles an expired leg against the underlying's close on
+        the expiry day, so this runs in the LIVE path. It belongs here and
+        not in fetch_alpaca_bars.py: that module carries its own module
+        level CLI_PATH and ENV_FILE pointing at the author's workstation
+        (`C:/Users/HMz/Documents/Source/...`), which do not exist on the
+        trading host. Measured 2026-09-03 on VPS2: every settlement raised
+        FileNotFoundError on that env.txt, IWM_short was halted at startup
+        and AAPL_short after 20 consecutive failed polls - 4 of 25
+        instruments dead with the market about to open. This method takes
+        its path and its keys from the SAME config-driven AlpacaCli every
+        order already goes through, so there is one place that knows where
+        the binary and the keys are.
+
+        Paged to exhaustion on next_page_token; a page that errors raises.
+        """
+        bars: list[dict] = []
+        token: str | None = None
+        while True:
+            cmd = ["data", "bars", "--symbol", symbol,
+                   "--timeframe", "1Day", "--start", start, "--end", end,
+                   "--adjustment", "split", "--limit", "10000"]
+            if token:
+                cmd += ["--page-token", token]
+            body = self._run(cmd)
+            bars += (body.get("bars") or []) if body else []
+            token = (body or {}).get("next_page_token") or None
+            if not token:
+                return bars
+
     def positions(self) -> list[dict]:
         body = self._run(["position", "list"])
         return body if body else []
@@ -222,6 +264,48 @@ class AlpacaCli:
             f"orders_since({iso_ts}) still had pages after {max_pages} x "
             f"{page} orders - refusing to decide a cluster's fate on a "
             f"list that may be incomplete")
+
+    def activities(self, after: str, category: str = "non_trade_activity",
+                   page_size: int = 100) -> list[dict]:
+        """Every account booking of `category` created on or after `after`.
+
+        This is where fees, dividends, assignments and cash transfers
+        live - everything that moves cash without a fill. The report
+        reconciles against these instead of assuming a fee schedule,
+        because a rate that is right today is a wrong number tomorrow.
+
+        Paged to exhaustion. `--page-token` takes the id of the last row
+        of the previous page (verified against
+        `account activity list --help`), and a short page is the end of
+        the list.
+
+        The order is the BROKER'S, not booking order: `--direction asc`
+        sorts by the activity's own date, and the id it pages on carries
+        only a day stamp (`20260831000000000::<uuid>`), so rows of one day
+        come back in uuid order. Measured over 299 rows: first
+        created_at 18:29:19Z, last 15:19:08Z. A caller that needs a
+        running total in time order has to sort on `created_at` itself.
+        """
+        rows: list[dict] = []
+        token: str | None = None
+        while True:
+            cmd = ["account", "activity", "list",
+                   "--category", category,
+                   "--after", after,
+                   "--page-size", str(page_size),
+                   "--direction", "asc"]
+            if token:
+                cmd += ["--page-token", token]
+            body = self._run(cmd)
+            page = body if isinstance(body, list) else (
+                body.get("activities") or body.get("data") or [])
+            if not page:
+                break
+            rows += page
+            if len(page) < page_size:
+                break
+            token = page[-1]["id"]
+        return rows
 
     def order_get(self, order_id: str) -> dict:
         return self._run(["order", "get", "--order-id", order_id])
