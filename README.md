@@ -332,3 +332,20 @@ no retries, no fallbacks.
   gate may shrink or veto a rebuy the grid has already decided on (see
   `risk_gate.py`). Underlying choice and DTE/strike policy are still
   rules, not judgements.
+- 🔴 **The backtests behind those parameters never paid the bid/ask, and
+  paying it flips the result.** `backtest_options.py` prices every option
+  at the bar close, a traded print; its `--cost_usd` parameter existed and
+  every published run left it at 0. Measured on the live book: half the
+  bid/ask is **34.95 USD per spread per crossing**, 69.89 round trip,
+  median quote width 4.9 % of mid. The same 2.5-year SPY run goes
+
+      cost 0      +2,850.00 realized     drawdown -2,994
+      cost 17.00    -433.00              drawdown -3,716
+      cost 34.95  -6,172.65              drawdown -7,024
+
+  *The entire published profit was smaller than the cost that was never
+  charged.* `cost_usd` now has no default anywhere - every tool refuses to
+  start without it - but the parameters in `configs/` were chosen before
+  that, on a ten-day window whose own provenance comment reads
+  `win rate 1.0`. Treat every backtest figure in this README as an upper
+  bound. [DEVLOG.md](DEVLOG.md) has the tables.
